@@ -1,5 +1,7 @@
 # alpha-council
 
+**[Live dashboard](https://alpha-council-6hkkwmjbnsuyqd8rfnc494.streamlit.app)**
+
 **An AI research desk for crypto.** LLM agents propose, rank, veto and
 attack trade setups - but every number (entry, stop-loss, take-profit,
 backtest stats) is computed by code, never by a model. Setups are
