@@ -138,9 +138,12 @@ def validate(df: pd.DataFrame, interval: str = "1d") -> list[str]:
         issues.append("NaNs in OHLC")
     if (ohlc <= 0).any().any():
         issues.append("non-positive prices")
-    step = pd.Timedelta(days=1) if interval == "1d" else pd.Timedelta(hours=1)
+    # pandas 3 unified Timedelta with Tick offsets: arithmetic like step * 1.5
+    # raises TypeError there. Build the 1.5x threshold without arithmetic.
+    threshold = (pd.Timedelta(hours=36) if interval == "1d"
+                 else pd.Timedelta(minutes=90))
     gaps = df.index.to_series().diff().dropna()
-    missing = gaps[gaps > step * 1.5]
+    missing = gaps[gaps > threshold]
     if len(missing):
         issues.append(f"{len(missing)} missing-bar gaps")
     jumps = df["close"].pct_change().abs()
