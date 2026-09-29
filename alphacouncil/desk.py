@@ -20,6 +20,7 @@ import pandas as pd
 
 from .backtest import run
 from .data import load, validate
+from .evidence import evidence_score
 from .regime import classify, trades_by_regime
 from .indicators import atr, ema, rsi
 from .ml import ml_signal
@@ -57,6 +58,7 @@ class Candidate:
     vetoed: str = ""
     regime: str = ""
     regime_stats: dict = field(default_factory=dict)
+    evidence: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return {"index": self.index, "symbol": self.symbol,
@@ -80,6 +82,8 @@ class DeskResult:
     leaderboard: list[dict] = field(default_factory=list)
     council_log: list[dict] = field(default_factory=list)
     regime: dict = field(default_factory=dict)
+    correlation: dict = field(default_factory=dict)
+    distinct_opportunities: int = 0
 
 
 
@@ -333,6 +337,40 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
         if str(k).isdigit() and int(k) in approved_idx:
             approved_idx[int(k)].bear_case = v
 
+    # portfolio layer: pairwise return correlation + distinct opportunities
+    corr: dict = {}
+    rets = {}
+    for s in symbols:
+        try:
+            rets[s] = load(s, interval, offline=offline)["close"].pct_change().dropna().tail(180)
+        except Exception:  # noqa: BLE001
+            pass
+    for i, a in enumerate(symbols):
+        for b in symbols[i + 1:]:
+            if a in rets and b in rets:
+                joined = pd.concat([rets[a], rets[b]], axis=1, join="inner")
+                if len(joined) > 30:
+                    corr[f"{a}/{b}"] = round(float(joined.corr().iloc[0, 1]), 3)
+    approved_list = [c for c in candidates if not c.vetoed]
+    for c in approved_list:
+        try:
+            df_c = load(c.symbol, interval, offline=offline)
+            med_dv = float((df_c["close"] * df_c["volume"]).tail(90).median())
+        except Exception:  # noqa: BLE001
+            med_dv = 0.0
+        c.evidence = evidence_score(c.metrics, c.regime_stats, c.regime, med_dv)
+    distinct = 0
+    picked: list[str] = []
+    for c in sorted(approved_list, key=lambda x: -x.evidence.get("total", 0)):
+        dup = False
+        for p in picked:
+            if p == c.symbol or abs(corr.get(f"{p}/{c.symbol}", corr.get(f"{c.symbol}/{p}", 1.0))) >= 0.7:
+                dup = True
+                break
+        if not dup:
+            distinct += 1
+            picked.append(c.symbol)
+
     council_log = [
         {"stage": "analyst - market view", "output": market_view or "(no market view)"},
         {"stage": "strategist - ranking and theses",
@@ -347,4 +385,5 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
                       interval=interval,
                       live=model is not None and not isinstance(model, MockModel),
                       errors=errors, leaderboard=leaderboard,
-                      council_log=council_log, regime=summary)
+                      council_log=council_log, regime=summary,
+                      correlation=corr, distinct_opportunities=distinct)

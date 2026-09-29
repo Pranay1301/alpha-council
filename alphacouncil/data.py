@@ -147,3 +147,20 @@ def validate(df: pd.DataFrame, interval: str = "1d") -> list[str]:
     if (jumps > 0.5).any():
         issues.append(f"{int((jumps > 0.5).sum())} extreme price jumps (>50%)")
     return issues
+
+def probe(symbol: str, interval: str = "1d", offline: bool = False) -> dict:
+    """Data status for the UI: last bar, age, freshness, quality issues."""
+    try:
+        df = load(symbol, interval, offline=offline)
+    except Exception as exc:  # noqa: BLE001
+        return {"symbol": symbol, "error": str(exc)}
+    last = df.index[-1]
+    step = pd.Timedelta(hours=1) if interval == "1h" else pd.Timedelta(days=1)
+    age = pd.Timestamp.utcnow() - last
+    fresh = bool(last >= pd.Timestamp.utcnow() - 2 * step)
+    source = ("bundled sample" if offline
+              else ("exchange API / fresh cache" if fresh else "STALE cache"))
+    return {"symbol": symbol, "source": source,
+            "last_bar": last.strftime("%d %b %Y %H:%M UTC"),
+            "age_hours": round(age.total_seconds() / 3600, 1),
+            "fresh": fresh, "issues": validate(df, interval)}

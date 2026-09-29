@@ -14,7 +14,7 @@ from __future__ import annotations
 import pandas as pd
 import streamlit as st
 
-from alphacouncil.data import KRAKEN_PAIRS, load
+from alphacouncil.data import KRAKEN_PAIRS, load, probe
 from alphacouncil.desk import run_desk
 from alphacouncil.disclaimers import FULL, SHORT
 from alphacouncil.report import render_markdown
@@ -69,6 +69,18 @@ if run and symbols:
                     "backtests -> council debate..."):
         res = run_desk(symbols, interval, offline=not live, model=model)
 
+    dstat = []
+    stale = False
+    for s in res.symbols:
+        p = probe(s, interval, not live)
+        if "error" not in p:
+            dstat.append(f"**{s}**: {p['source']}, last bar {p['last_bar']}")
+            stale = stale or not p["fresh"]
+    if dstat:
+        st.caption("Data: " + " \u00b7 ".join(dstat))
+    if stale:
+        st.warning("Data is stale - results should not be interpreted as current.")
+
     st.subheader("Market view")
     st.write(res.market_view)
     if res.regime:
@@ -95,6 +107,13 @@ if run and symbols:
     vetoed = [c for c in res.candidates if c.vetoed]
 
     st.subheader(f"Trade suggestions ({len(approved)})")
+    if approved:
+        st.caption(f"{len(approved)} setups found \u00b7 "
+                   f"{res.distinct_opportunities} materially distinct "
+                   f"opportunities"
+                   + (f" \u00b7 correlations: "
+                      + ", ".join(f"{k} {v}" for k, v in res.correlation.items())
+                      if res.correlation else ""))
     if not approved:
         st.error("NO ACTIONABLE SETUPS")
         for c in vetoed:
@@ -139,6 +158,10 @@ if run and symbols:
                             f"\u00b7 \u2713 worst DD {m.get('max_drawdown', 0):.0%} "
                             f"\u00b7 \u2713 {m.get('profitable_windows', 0):.0%} profitable windows "
                             f"\u00b7 \u2713 param stability {m.get('param_stability', 0):.0%}")
+                if c.evidence:
+                    ev = c.evidence
+                    comp = " \u00b7 ".join(f"{k} {v:.2f}" for k, v in ev["components"].items())
+                    st.markdown(f"**Evidence score: {ev['total']}/100** (deterministic, not LLM)  \u2003{comp}")
                 if c.regime_stats:
                     def _pfkey(kv):
                         pf = kv[1]["profit_factor"]
