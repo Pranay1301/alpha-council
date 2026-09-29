@@ -151,7 +151,7 @@ if run and symbols:
         ov_rows.append({"Coin": s, "Regime": dd.get("regime", "-"),
                         "Trend (EMA20/50)": dd.get("ema20_vs_ema50", "-"),
                         "ATR %": dd.get("atr_pct", "-"),
-                        "BTC beta (180 bars)": res.beta_to_btc.get(s, "-"),
+                        "BTC beta (180 bars)": getattr(res, "beta_to_btc", {}).get(s, "-"),
                         "Approved setups": n_ok})
     st.dataframe(pd.DataFrame(ov_rows), width="stretch", hide_index=True)
     st.caption("BTC beta is historical covariance / BTC variance on aligned "
