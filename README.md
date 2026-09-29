@@ -94,7 +94,7 @@ The council runs on free, OpenAI-compatible providers - no paid key needed:
 
 | provider | model | get a key |
 |---|---|---|
-| Groq (default) | `llama-3.1-8b-instant` | console.groq.com |
+| Groq (default) | `openai/gpt-oss-120b` | console.groq.com |
 | z.ai | `glm-4.5-flash` ($0) | z.ai |
 | OpenRouter | `openrouter/free` | openrouter.ai |
 

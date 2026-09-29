@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 FREE_PROVIDERS = {
-    "groq": ("https://api.groq.com/openai/v1", "llama-3.1-8b-instant", "GROQ_API_KEY"),
+    "groq": ("https://api.groq.com/openai/v1", "openai/gpt-oss-120b", "GROQ_API_KEY"),
     "zai": ("https://api.z.ai/api/paas/v4", "glm-4.5-flash", "ZAI_API_KEY"),
     "openrouter": ("https://openrouter.ai/api/v1", "openrouter/free", "OPENROUTER_API_KEY"),
 }
