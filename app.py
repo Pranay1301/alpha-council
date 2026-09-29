@@ -67,7 +67,17 @@ if run and symbols:
 
     with st.spinner("Desk is working: data -> strategies -> walk-forward "
                     "backtests -> council debate..."):
-        res = run_desk(symbols, interval, offline=not live, model=model)
+        try:
+            res = run_desk(symbols, interval, offline=not live, model=model)
+        except Exception as exc:  # noqa: BLE001 - degrade, never red-crash
+            import platform
+            import traceback
+            st.error(f"The desk run hit an unexpected error: {exc!r}")
+            with st.expander("Diagnostics for the maintainer"):
+                st.code(
+                    f"python {platform.python_version()} · pandas {pd.__version__}\n\n"
+                    + traceback.format_exc())
+            st.stop()
 
     dstat = []
     stale = False

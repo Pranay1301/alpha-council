@@ -131,10 +131,14 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{symbol}: data load failed: {exc}")
             continue
-        for issue in validate(df, interval):
-            errors.append(f"{symbol} data quality: {issue}")
-        current_atr = float(atr(df["high"], df["low"], df["close"]).iloc[-1])
-        price = float(df["close"].iloc[-1])
+        try:
+            for issue in validate(df, interval):
+                errors.append(f"{symbol} data quality: {issue}")
+            current_atr = float(atr(df["high"], df["low"], df["close"]).iloc[-1])
+            price = float(df["close"].iloc[-1])
+        except Exception as exc:  # noqa: BLE001 - one bad frame must not kill the run
+            errors.append(f"{symbol}: data validation failed: {exc!r}")
+            continue
 
         for name, fn in STRATEGIES.items():
             try:
