@@ -53,6 +53,17 @@ def render_markdown(res: DeskResult) -> str:
             lines.append(f"- **{c.symbol} {c.strategy}**: {c.vetoed}")
         lines.append("")
 
+    if res.audit_log:
+        lines.append("## Council run audit metadata\n")
+        for item in res.audit_log:
+            lines.append(f"- {item['stage']}: {item['provider']} / {item['model']} "
+                         f"at {item['timestamp_utc']}; prompt SHA256 "
+                         f"{item['prompt_version']}; input SHA256 "
+                         f"{item['input_hash']}; output SHA256 "
+                         f"{item['output_hash']}; {item['latency_ms']} ms, "
+                         f"tokens {item['prompt_tokens']}+{item['completion_tokens']}")
+        lines.append("")
+
     if res.risk_notes:
         lines.append("## Risk notes (risk manager agent)\n")
         lines.append(res.risk_notes + "\n")

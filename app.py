@@ -15,6 +15,8 @@ import pandas as pd
 import streamlit as st
 
 from alphacouncil.data import KRAKEN_PAIRS, load, probe
+from alphacouncil.indicators import ema
+from alphacouncil.desk import BT_KW
 from alphacouncil.desk import run_desk
 from alphacouncil.disclaimers import FULL, SHORT
 from alphacouncil.report import render_markdown
@@ -28,11 +30,45 @@ def _track_record(symbols: tuple, interval: str, offline: bool):
     rows = replay(list(symbols), interval, offline)
     return rows, summary(rows)
 
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _offline_desk(symbols: tuple[str, ...], interval: str):
+    # Cache deterministic offline quant; never cache a live LLM result or API key.
+    return run_desk(list(symbols), interval, offline=True, model=None)
+
+
+def _candles(df: pd.DataFrame, title: str, candidate=None):
+    import plotly.graph_objects as go
+    from plotly.subplots import make_subplots
+    df = df.tail(120)
+    fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
+                        row_heights=[0.78, 0.22], vertical_spacing=0.04)
+    fig.add_trace(go.Candlestick(x=df.index, open=df["open"], high=df["high"],
+                                 low=df["low"], close=df["close"], name="OHLC"), row=1, col=1)
+    for n, color in ((20, "#46b3ff"), (50, "#ffbd59")):
+        fig.add_trace(go.Scatter(x=df.index, y=ema(df["close"], n),
+                                 mode="lines", name=f"EMA{n}",
+                                 line=dict(color=color, width=1.5)), row=1, col=1)
+    if candidate is not None:
+        for key, color in (("entry", "#45cf89"), ("stop", "#fa646e"),
+                           ("target", "#e8ba4d")):
+            fig.add_hline(y=getattr(candidate, key), line_dash="dash",
+                          line_color=color, annotation_text=key.title(), row=1, col=1)
+    fig.add_trace(go.Bar(x=df.index, y=df["volume"], name="Volume",
+                         marker_color="#64748b"), row=2, col=1)
+    fig.update_layout(height=430, title=title, template="plotly_dark",
+                      xaxis_rangeslider_visible=False, margin=dict(t=50, b=10, l=5, r=10))
+    return fig
+
 st.title("alpha-council")
 st.caption("An AI research desk for crypto. LLM agents propose, rank and "
            "attack trade setups; code owns every number; risk policy can "
            "veto anything.")
 st.warning(SHORT)
+st.markdown("**Research workflow**  Market data → rolling out-of-sample tests → "
+            "council debate → hard risk veto. No setup is a valid result.")
+st.caption("Markets: BTC · ETH · SOL | Modes: bundled offline sample or fresh live "
+           "data | Council: analyst, strategist, risk manager, critic")
 
 with st.sidebar:
     st.header("Universe")
@@ -44,10 +80,20 @@ with st.sidebar:
                      help="Off: bundled data + scripted mock council. "
                           "On: fresh market data + a real LLM.")
     provider = st.selectbox("Free-tier provider", ["groq", "zai", "openrouter"])
-    api_key = st.text_input("API key", type="password",
-                            help=f"Free key from the {provider} console. "
-                                 "Never stored.")
-    run = st.button("Run the desk", type="primary", use_container_width=True)
+    try:
+        from alphacouncil.model import FREE_PROVIDERS
+        configured_key = st.secrets.get(FREE_PROVIDERS[provider][2], "") if live else ""
+    except Exception:
+        configured_key = ""
+    api_key = ""
+    if live:
+        if configured_key:
+            st.success("Council connected via deployment secret. No key to paste.")
+        else:
+            api_key = st.text_input("API key", type="password",
+                                    help=f"Free key from the {provider} console. "
+                                         "Not stored by the app.")
+    run = st.button("Run the desk", type="primary", width="stretch")
 
 if run and symbols:
     model = None
@@ -55,10 +101,7 @@ if run and symbols:
         import os
         from alphacouncil.model import FREE_PROVIDERS, OpenAIModel
         if not api_key:
-            try:
-                api_key = st.secrets.get("GROQ_API_KEY", "")
-            except Exception:
-                api_key = ""
+            api_key = configured_key
         if not api_key:
             st.error("Live council needs an API key (free tier is fine).")
             st.stop()
@@ -68,15 +111,13 @@ if run and symbols:
     with st.spinner("Desk is working: data -> strategies -> walk-forward "
                     "backtests -> council debate..."):
         try:
-            res = run_desk(symbols, interval, offline=not live, model=model)
-        except Exception as exc:  # noqa: BLE001 - degrade, never red-crash
-            import platform
-            import traceback
-            st.error(f"The desk run hit an unexpected error: {exc!r}")
-            with st.expander("Diagnostics for the maintainer"):
-                st.code(
-                    f"python {platform.python_version()} · pandas {pd.__version__}\n\n"
-                    + traceback.format_exc())
+            res = (run_desk(symbols, interval, offline=False, model=model)
+                   if live else _offline_desk(tuple(symbols), interval))
+        except Exception:  # noqa: BLE001 - public app must not disclose secrets
+            import logging
+            logging.getLogger(__name__).exception("Desk run failed")
+            st.error("The desk run could not finish. Please try again later. "
+                     "No trade suggestion was issued.")
             st.stop()
 
     dstat = []
@@ -111,7 +152,14 @@ if run and symbols:
                         "Trend (EMA20/50)": dd.get("ema20_vs_ema50", "-"),
                         "ATR %": dd.get("atr_pct", "-"),
                         "Approved setups": n_ok})
-    st.dataframe(pd.DataFrame(ov_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(ov_rows), width="stretch", hide_index=True)
+    with st.expander("Market charts (120 bars · candles, EMA20/50, volume)"):
+        for sym in res.symbols:
+            try:
+                st.plotly_chart(_candles(load(sym, interval, offline=not live), sym),
+                                width="stretch")
+            except Exception as exc:
+                st.caption(f"{sym} chart unavailable: {exc}")
 
     approved = [c for c in res.candidates if not c.vetoed]
     vetoed = [c for c in res.candidates if c.vetoed]
@@ -187,10 +235,24 @@ if run and symbols:
                 st.text(f"Critic      -> {(c.bear_case or 'no objection')[:180]}")
             try:
                 df = load(c.symbol, interval, offline=not live)
-                st.line_chart(df["close"].tail(120), height=180)
+                st.plotly_chart(_candles(df, c.symbol, c), width="stretch")
             except Exception:
                 pass
 
+    with st.expander("Backtest methodology and limits"):
+        st.markdown(f"**Evaluation:** 3 expanding training windows, each followed "
+                    f"by a held-out test. ML is refit on each training window. "
+                    f"Reported profit factor is the median across folds; drawdown "
+                    f"is the worst fold. Train parameters are frozen on each test.\n\n"
+                    f"**Execution:** signal at bar close, next-bar open entry, "
+                    f"stop/target checks from subsequent bars. A bar touching both "
+                    f"counts as a stop. Stop distance {BT_KW['stop_atr']}× ATR, "
+                    f"target {BT_KW['rr']}× risk, fees {BT_KW['fee_bps']:.0f} bps "
+                    f"each side, slippage {BT_KW['slippage_bps']:.0f} bps on "
+                    f"entry/exit, maximum hold 30 bars.\n\n"
+                    "**Limits:** sample size, regime changes, flat transaction costs "
+                    "and no funding or liquidity model. Historical results are not "
+                    "a forecast. The replay below is not a live paper-trading ledger.")
     if vetoed:
         with st.expander(f"Vetoed by risk policy ({len(vetoed)})"):
             for c in vetoed:
@@ -207,13 +269,20 @@ if run and symbols:
         st.subheader("Strategy leaderboard (out-of-sample)")
         lb = pd.DataFrame(res.leaderboard).sort_values(
             "profit_factor", ascending=False)
-        st.dataframe(lb, use_container_width=True, hide_index=True)
+        st.dataframe(lb, width="stretch", hide_index=True)
 
     if res.council_log:
         with st.expander("Full council debate"):
             for stage in res.council_log:
                 st.markdown(f"**{stage['stage']}**")
                 st.text(stage["output"][:2000])
+
+    if res.audit_log:
+        with st.expander("Council run audit metadata"):
+            st.caption("Hashes identify inputs, prompts and outputs without "
+                       "publishing their contents. No API key is recorded.")
+            st.dataframe(pd.DataFrame(res.audit_log), width="stretch",
+                         hide_index=True)
 
     st.subheader("Track record - the desk grades its own calls")
     st.caption("The quant engine replayed at past checkpoints on the data "
@@ -226,9 +295,14 @@ if run and symbols:
         st.caption(f"{tr_sum['calls']} replayed calls \u00b7 "
                    f"{tr_sum['wins']}/{tr_sum['graded']} graded wins "
                    f"({tr_sum['win_rate']:.0%}) \u00b7 "
-                   f"avg return {tr_sum['avg_return_pct']}%")
-        st.dataframe(pd.DataFrame(tr_rows), use_container_width=True,
+                   f"avg return {tr_sum['avg_return_pct']}% · "
+                   f"profit factor "
+                   f"{tr_sum['profit_factor'] if tr_sum['profit_factor'] is not None else 'undefined (no losses)'}")
+        st.dataframe(pd.DataFrame(tr_rows), width="stretch",
                      hide_index=True)
+        st.caption("MAE/MFE bound the move through the exit bar; intrabar order "
+                   "is unknown. This is retrospective replay, not a persistent "
+                   "paper-trading ledger or observed live performance.")
     else:
         st.info("No signals fired at the replay checkpoints.")
 

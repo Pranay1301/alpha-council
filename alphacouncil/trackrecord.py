@@ -42,20 +42,28 @@ def _best_call_at(df: pd.DataFrame, symbol: str, interval: str) -> dict | None:
 
 def grade_call(entry: float, stop: float, target: float,
                future: pd.DataFrame) -> dict:
-    """Grade a long call against the bars that followed it. A bar touching
-    both stop and target counts as stopped out (conservative)."""
+    """Grade a historical long call; stop wins a same-bar collision.
+
+    Excursions include the high/low of the exit bar. Intrabar order is unknown,
+    so these are bounds, not a claim about tick-level path or executable fills.
+    """
+    low = high = entry
     for i in range(len(future)):
-        lo = float(future["low"].iloc[i])
-        hi = float(future["high"].iloc[i])
+        lo, hi = float(future["low"].iloc[i]), float(future["high"].iloc[i])
+        low, high = min(low, lo), max(high, hi)
+        excursions = {"mae_pct": (low - entry) / entry,
+                      "mfe_pct": (high - entry) / entry}
         if lo <= stop:
             return {"outcome": "stopped", "return_pct": (stop - entry) / entry,
-                    "bars": i + 1}
+                    "bars": i + 1, **excursions}
         if hi >= target:
             return {"outcome": "target hit",
-                    "return_pct": (target - entry) / entry, "bars": i + 1}
+                    "return_pct": (target - entry) / entry,
+                    "bars": i + 1, **excursions}
     last = float(future["close"].iloc[-1]) if len(future) else entry
     return {"outcome": "open", "return_pct": (last - entry) / entry,
-            "bars": len(future)}
+            "bars": len(future), "mae_pct": (low - entry) / entry,
+            "mfe_pct": (high - entry) / entry}
 
 
 def replay(symbols, interval: str = "1d", offline: bool = False,
@@ -83,7 +91,10 @@ def replay(symbols, interval: str = "1d", offline: bool = False,
                          "target": round(call["target"], 2),
                          "test_pf": round(call["test_pf"], 2),
                          "outcome": g["outcome"],
-                         "return_pct": round(g["return_pct"] * 100, 2)})
+                         "return_pct": round(g["return_pct"] * 100, 2),
+                         "bars_held": g["bars"],
+                         "mae_pct": round(g["mae_pct"] * 100, 2),
+                         "mfe_pct": round(g["mfe_pct"] * 100, 2)})
     return rows
 
 
@@ -91,6 +102,10 @@ def summary(rows: list[dict]) -> dict:
     graded = [r for r in rows if r["outcome"] != "open"]
     wins = [r for r in graded if r["outcome"] == "target hit"]
     avg = sum(r["return_pct"] for r in rows) / len(rows) if rows else 0.0
+    positive = sum(max(0, r["return_pct"]) for r in graded)
+    negative = -sum(min(0, r["return_pct"]) for r in graded)
+    pf = (positive / negative) if negative else None  # undefined with zero losses
     return {"calls": len(rows), "graded": len(graded), "wins": len(wins),
             "win_rate": (len(wins) / len(graded)) if graded else 0.0,
-            "avg_return_pct": round(avg, 2)}
+            "avg_return_pct": round(avg, 2),
+            "profit_factor": round(pf, 2) if pf is not None else None}

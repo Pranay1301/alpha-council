@@ -29,8 +29,8 @@ market data (free public APIs)                LLM council (free-tier models)
   reversion, breakout, ML)                    the thesis for each
         │                                              │
   walk-forward backtester         risk mgr:   vetoes weak evidence
-  (train on 70%, score on                     (code enforces the same
-  unseen 30%, fees + slippage)                rules - model veto is advisory)
+  (3 expanding train/test                   (code enforces the same
+  folds, fees + slippage)                    rules - model veto is advisory)
         │                                              │
         └──────────►  suggestion cards  ◄────  critic: writes the bear case
                      entry / stop / target             for every approval
@@ -42,19 +42,31 @@ LLM cannot move a stop-loss, invent a win rate, or talk a losing strategy
 onto the list - the risk policy in code rejects it regardless of what any
 agent says.
 
-## What a suggestion looks like (real offline run)
+## Reading the dashboard
 
-```
-### BTCUSD - LONG - trend_following
-- entry ~ 84,288 | stop 79,815 | target 93,235 (R:R 2.0, ATR-based stop)
-- backtest (out-of-sample): 13 trades, win rate 61.5%, profit factor 1.26,
-  max drawdown 15.2%, Sharpe 0.44
-- thesis (strategist agent): ...
-- bear case (critic agent): ...
-```
+Use **Run the desk** in quant-only mode for a reproducible offline sample.
+Turn on the live council for fresh data and LLM analysis. A deployment
+secret connects Groq without showing an API-key field; other providers
+can be configured separately. The Market overview, candlestick/EMA/volume
+charts, leaderboard, backtest methodology and track-record replay stay
+available when no setup passes the policy.
 
-Every card carries its **out-of-sample** backtest stats. When nothing
-passes the risk policy, the desk says so - no suggestion IS the suggestion.
+**The current bundled daily sample has zero approved suggestions.** BTC
+trend-following has median held-out profit factor 0.95; SOL trend-following
+has 0.58, both below the 1.0 veto threshold. The old single-split scores
+should not be used as evidence. The replay table measures selected past
+checkpoints on truncated historical data and now shows bars held and
+MAE/MFE; it is **not** a persistent paper-trading ledger or proof of
+live trading performance. The portfolio layer reports return correlation
+and groups strongly correlated approvals as one distinct opportunity;
+this is not a complete beta or thematic exposure model.
+
+Each live council stage records provider, model, UTC timestamp, SHA-256
+prompt/input/output hashes, latency and token usage in the exported report.
+No API key or raw model input is included in that metadata. An LLM council
+**effectiveness** claim would require prospective or carefully simulated
+paired quant-only vs council decisions with later outcomes. This project
+does not claim to have measured that yet.
 
 ## The strategies
 
@@ -75,13 +87,15 @@ Execution rules in `alphacouncil/backtest.py`:
 - If one bar touches both stop and target, the **stop is assumed hit
   first**. Conservative on purpose.
 - Exits: stop-loss, take-profit, signal-off, or max holding period.
-- Parameter selection is **walk-forward**: grid-search on the first 70%
-  of history, then scored once on the held-out 30%. The number you see on
-  a card is the out-of-sample score, never the training score.
+- Parameter selection is **rolling walk-forward**: three expanding training
+  folds, each followed by an unseen test segment. ML is refit on each
+  training fold. Cards show median test profit factor, worst test drawdown,
+  total test trades, profitable-fold share and parameter stability. The
+  method does not guarantee independence across correlated regimes.
 
 Known limits (read these before trusting any backtest, here or anywhere):
 no liquidity/slippage modeling beyond a flat assumption, no funding or
-borrow costs, regime changes break edges, and 2 years of daily bars is a
+borrow costs, regime changes break edges, and limited daily history is a
 small sample. A good out-of-sample result is evidence, not a promise.
 
 ## Risk policy (enforced in code, not by prompt)

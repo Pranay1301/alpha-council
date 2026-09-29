@@ -12,6 +12,9 @@ def test_grade_target_hit():
     g = grade_call(100, 95, 110, fut)
     assert g["outcome"] == "target hit"
     assert abs(g["return_pct"] - 0.10) < 1e-9
+    assert abs(g["mae_pct"] - (-0.01)) < 1e-9
+    assert abs(g["mfe_pct"] - 0.12) < 1e-9
+    assert g["bars"] == 2
 
 
 def test_grade_stopped():
@@ -42,6 +45,7 @@ def test_summary_math():
     assert s["calls"] == 3 and s["graded"] == 2 and s["wins"] == 1
     assert s["win_rate"] == 0.5
     assert s["avg_return_pct"] == 2.0
+    assert s["profit_factor"] == 2.0
 
 
 def test_replay_offline_runs():

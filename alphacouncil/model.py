@@ -39,6 +39,8 @@ class OpenAIModel:
         self.client = OpenAI(api_key=api_key or os.environ["OPENAI_API_KEY"],
                              base_url=base_url)
         self.model = model
+        self.provider = next((name for name, (url, _, _) in FREE_PROVIDERS.items()
+                              if url == base_url), "custom")
 
     @classmethod
     def from_provider(cls, provider: str, model: str | None = None) -> "OpenAIModel":

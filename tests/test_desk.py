@@ -45,3 +45,14 @@ if __name__ == "__main__":
         fn()
         print(f"pass: {name}")
     print("all desk tests passed")
+
+
+def test_council_run_records_hashed_metadata_without_raw_payload():
+    res = run_desk(["BTCUSD"], "1d", offline=True, model=mock_council())
+    assert len(res.audit_log) == 4
+    for item in res.audit_log:
+        assert len(item["input_hash"]) == 64 and len(item["output_hash"]) == 64
+        assert len(item["prompt_version"]) == 64
+        assert item["provider"] == "MockModel"
+        assert item["latency_ms"] >= 0
+    assert "Council run audit metadata" in render_markdown(res)

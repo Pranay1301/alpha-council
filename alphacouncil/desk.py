@@ -13,6 +13,9 @@ Two layers, strictly separated:
 from __future__ import annotations
 
 import json
+import hashlib
+import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -84,6 +87,7 @@ class DeskResult:
     regime: dict = field(default_factory=dict)
     correlation: dict = field(default_factory=dict)
     distinct_opportunities: int = 0
+    audit_log: list[dict] = field(default_factory=list)
 
 
 
@@ -259,14 +263,32 @@ def validate_llm(prompt_name: str, parsed: dict) -> dict:
     return parsed
 
 def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict,
-         raw_as: str | None = None) -> dict:
+         raw_as: str | None = None, audit_log: list[dict] | None = None) -> dict:
     if model is None:
         return fallback
     system = (PROMPTS_DIR / prompt_name).read_text()
-    resp = model.complete([
+    messages = [
         {"role": "system", "content": system},
-        {"role": "user", "content": json.dumps(payload, indent=2)},
-    ])
+        {"role": "user", "content": json.dumps(payload, indent=2, sort_keys=True)},
+    ]
+    started_at = datetime.now(timezone.utc).isoformat()
+    start = time.monotonic()
+    resp = model.complete(messages)
+    if audit_log is not None:
+        def digest(value: str) -> str:
+            return hashlib.sha256(value.encode("utf-8")).hexdigest()
+        audit_log.append({
+            "stage": prompt_name.removesuffix(".md"),
+            "provider": getattr(model, "provider", type(model).__name__),
+            "model": getattr(model, "model", "mock"),
+            "timestamp_utc": started_at,
+            "prompt_version": digest(system),
+            "input_hash": digest(messages[1]["content"]),
+            "output_hash": digest(resp.content),
+            "latency_ms": round((time.monotonic() - start) * 1000),
+            "prompt_tokens": resp.prompt_tokens,
+            "completion_tokens": resp.completion_tokens,
+        })
     parsed = parse_json(resp.content)
     if parsed:
         return validate_llm(prompt_name, parsed)
@@ -289,8 +311,9 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
     summary["interval"] = interval
     summary["live_candidates"] = len(candidates)
 
+    audit_log: list[dict] = []
     analyst = _ask(model, "analyst.md", summary,
-                   {"market_view": ""}, raw_as="market_view")
+                   {"market_view": ""}, raw_as="market_view", audit_log=audit_log)
     market_view = analyst.get("market_view") or analyst.get("reason") or ""
     if not market_view and model is None:
         market_view = "(no model attached - quant-only run)"
@@ -298,7 +321,8 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
         market_view = next((v for v in analyst.values() if isinstance(v, str)), "")
 
     payload = {"candidates": [c.to_json() for c in candidates]}
-    strat = _ask(model, "strategist.md", payload, {"ranked": "all", "thesis": {}})
+    strat = _ask(model, "strategist.md", payload, {"ranked": "all", "thesis": {}},
+                audit_log=audit_log)
     # thesis keys refer to the ORIGINAL indices in payload - apply before reordering
     for k, v in (strat.get("thesis") or {}).items():
         if str(k).isdigit() and int(k) in {c.index for c in candidates}:
@@ -314,7 +338,8 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
 
     risk_payload = {"candidates": [c.to_json() for c in candidates]}
     risk = _ask(model, "risk.md", risk_payload,
-                {"vetoes": {}, "approved": [c.index for c in candidates], "notes": ""})
+                {"vetoes": {}, "approved": [c.index for c in candidates], "notes": ""},
+                audit_log=audit_log)
     # code enforces the risk policy too - the LLM's veto is advisory,
     # the hard rules below are not
     for c in candidates:
@@ -335,7 +360,7 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
     approved = [c for c in candidates if not c.vetoed]
     critic = _ask(model, "critic.md",
                   {"candidates": [c.to_json() for c in approved]},
-                  {"bear_case": {}})
+                  {"bear_case": {}}, audit_log=audit_log)
     approved_idx = {c.index: c for c in approved}
     for k, v in (critic.get("bear_case") or {}).items():
         if str(k).isdigit() and int(k) in approved_idx:
@@ -390,4 +415,5 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
                       live=model is not None and not isinstance(model, MockModel),
                       errors=errors, leaderboard=leaderboard,
                       council_log=council_log, regime=summary,
-                      correlation=corr, distinct_opportunities=distinct)
+                      correlation=corr, distinct_opportunities=distinct,
+                      audit_log=audit_log)
