@@ -86,6 +86,7 @@ class DeskResult:
     council_log: list[dict] = field(default_factory=list)
     regime: dict = field(default_factory=dict)
     correlation: dict = field(default_factory=dict)
+    beta_to_btc: dict = field(default_factory=dict)
     distinct_opportunities: int = 0
     audit_log: list[dict] = field(default_factory=list)
 
@@ -380,6 +381,19 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
                 joined = pd.concat([rets[a], rets[b]], axis=1, join="inner")
                 if len(joined) > 30:
                     corr[f"{a}/{b}"] = round(float(joined.corr().iloc[0, 1]), 3)
+    # Empirical beta, not an investable factor model: aligned close-to-close
+    # returns over up to 180 bars. No BTC data means beta is unavailable.
+    beta_to_btc: dict = {}
+    if "BTCUSD" in rets and len(rets["BTCUSD"]) > 30:
+        btc = rets["BTCUSD"]
+        for sym, returns in rets.items():
+            aligned = pd.concat([returns, btc], axis=1, join="inner").dropna()
+            if len(aligned) < 30:
+                continue
+            variance = float(aligned.iloc[:, 1].var())
+            if variance > 1e-12:
+                beta_to_btc[sym] = round(float(aligned.iloc[:, 0].cov(
+                    aligned.iloc[:, 1]) / variance), 2)
     approved_list = [c for c in candidates if not c.vetoed]
     for c in approved_list:
         try:
@@ -415,5 +429,6 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
                       live=model is not None and not isinstance(model, MockModel),
                       errors=errors, leaderboard=leaderboard,
                       council_log=council_log, regime=summary,
-                      correlation=corr, distinct_opportunities=distinct,
+                      correlation=corr, beta_to_btc=beta_to_btc,
+                      distinct_opportunities=distinct,
                       audit_log=audit_log)

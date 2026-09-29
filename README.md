@@ -57,9 +57,10 @@ has 0.58, both below the 1.0 veto threshold. The old single-split scores
 should not be used as evidence. The replay table measures selected past
 checkpoints on truncated historical data and now shows bars held and
 MAE/MFE; it is **not** a persistent paper-trading ledger or proof of
-live trading performance. The portfolio layer reports return correlation
-and groups strongly correlated approvals as one distinct opportunity;
-this is not a complete beta or thematic exposure model.
+live trading performance. The portfolio layer reports return correlation and historical BTC beta
+(covariance/variance on up to 180 aligned return bars), and groups strongly
+correlated approvals as one distinct opportunity; this is not a complete
+portfolio sizing or thematic exposure model.
 
 Each live council stage records provider, model, UTC timestamp, SHA-256
 prompt/input/output hashes, latency and token usage in the exported report.

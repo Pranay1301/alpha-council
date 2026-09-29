@@ -56,3 +56,9 @@ def test_council_run_records_hashed_metadata_without_raw_payload():
         assert item["provider"] == "MockModel"
         assert item["latency_ms"] >= 0
     assert "Council run audit metadata" in render_markdown(res)
+
+
+def test_empirical_btc_beta_on_bundled_data():
+    res = run_desk(["BTCUSD", "ETHUSD"], "1d", offline=True, model=None)
+    assert abs(res.beta_to_btc["BTCUSD"] - 1.0) < 0.01
+    assert "ETHUSD" in res.beta_to_btc
