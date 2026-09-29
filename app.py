@@ -144,6 +144,20 @@ if run and symbols:
             st.caption(" \u00b7 ".join(bits))
 
     st.subheader("Market overview")
+    # Streamlit can rerun new app.py while an older desk module stays imported.
+    # Calculate a display fallback from the same data until a full restart.
+    betas = getattr(res, "beta_to_btc", {})
+    if not betas and "BTCUSD" in res.symbols:
+        try:
+            btc = load("BTCUSD", interval, offline=not live)["close"].pct_change(fill_method=None).tail(180)
+            for sym in res.symbols:
+                ret = load(sym, interval, offline=not live)["close"].pct_change(fill_method=None).tail(180)
+                aligned = pd.concat([ret, btc], axis=1, join="inner").dropna()
+                variance = float(aligned.iloc[:, 1].var()) if len(aligned) >= 30 else 0.0
+                if variance > 1e-12:
+                    betas[sym] = round(float(aligned.iloc[:, 0].cov(aligned.iloc[:, 1]) / variance), 2)
+        except Exception:
+            pass  # beta unavailable is not a reason to suppress the desk
     ov_rows = []
     for s in res.symbols:
         dd = res.regime.get(s, {}) if isinstance(res.regime, dict) else {}
@@ -151,7 +165,7 @@ if run and symbols:
         ov_rows.append({"Coin": s, "Regime": dd.get("regime", "-"),
                         "Trend (EMA20/50)": dd.get("ema20_vs_ema50", "-"),
                         "ATR %": dd.get("atr_pct", "-"),
-                        "BTC beta (180 bars)": getattr(res, "beta_to_btc", {}).get(s, "-"),
+                        "BTC beta (180 bars)": betas.get(s, "-"),
                         "Approved setups": n_ok})
     st.dataframe(pd.DataFrame(ov_rows), width="stretch", hide_index=True)
     st.caption("BTC beta is historical covariance / BTC variance on aligned "
