@@ -116,3 +116,34 @@ def load(symbol: str, interval: str = "1d", offline: bool = False,
     if cached.exists():
         return from_csv(cached)  # stale cache beats no data
     raise RuntimeError(f"all data sources failed for {symbol} {interval}: {last_err}")
+
+
+def validate(df: pd.DataFrame, interval: str = "1d") -> list[str]:
+    """Data-quality checks. Returns a list of problems (empty = clean).
+    Bad market data should never silently reach the strategy engine."""
+    issues: list[str] = []
+    if df is None or df.empty:
+        return ["empty frame"]
+    if not df.index.is_monotonic_increasing:
+        issues.append("timestamps not chronological")
+    if df.index.has_duplicates:
+        issues.append(f"{int(df.index.duplicated().sum())} duplicate timestamps")
+    ohlc = df[["open", "high", "low", "close"]]
+    bad = (df["low"] > ohlc.min(axis=1) + 1e-9) | (df["high"] < ohlc.max(axis=1) - 1e-9)
+    if bad.any():
+        issues.append(f"{int(bad.sum())} bars with inconsistent OHLC")
+    if (df["volume"] < 0).any():
+        issues.append("negative volume")
+    if ohlc.isna().any().any():
+        issues.append("NaNs in OHLC")
+    if (ohlc <= 0).any().any():
+        issues.append("non-positive prices")
+    freq = pd.tseries.frequencies.to_offset("1D" if interval == "1d" else "1h")
+    gaps = df.index.to_series().diff().dropna()
+    missing = gaps[gaps > freq * 1.5]
+    if len(missing):
+        issues.append(f"{len(missing)} missing-bar gaps")
+    jumps = df["close"].pct_change().abs()
+    if (jumps > 0.5).any():
+        issues.append(f"{int((jumps > 0.5).sum())} extreme price jumps (>50%)")
+    return issues

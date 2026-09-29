@@ -19,7 +19,7 @@ from pathlib import Path
 import pandas as pd
 
 from .backtest import run
-from .data import load
+from .data import load, validate
 from .indicators import atr, ema, rsi
 from .ml import ml_signal
 from .model import MockModel, Model, parse_json
@@ -79,6 +79,41 @@ class DeskResult:
     regime: dict = field(default_factory=dict)
 
 
+
+def _ml_walk_forward(df: pd.DataFrame, interval: str, n_folds: int = 3,
+                     train_frac: float = 0.5, bt_kwargs: dict | None = None):
+    """ML through the same rolling windows as the rule strategies: refit on
+    each fold's training window, signals only on its held-out window."""
+    import numpy as np
+    bt_kwargs = bt_kwargs or {}
+    n = len(df)
+    test_len = int(n * (1 - train_frac) / n_folds)
+    tms = []
+    for k in range(n_folds):
+        split = int(n * train_frac) + k * test_len
+        if split + test_len > n:
+            break
+        sub = df.iloc[:split + test_len]
+        sig = ml_signal(sub, fit_frac=split / len(sub))
+        res = run(df.iloc[split:split + test_len], sig.iloc[split:],
+                  interval=interval, **bt_kwargs)
+        m = res.metrics()
+        if m.get("trades", 0):
+            tms.append(m)
+    if not tms:
+        return None
+    pfs = [m.get("profit_factor", 0) for m in tms]
+    return {"win_rate": float(np.median([m.get("win_rate", 0) for m in tms])),
+            "profit_factor": float(np.median(pfs)),
+            "max_drawdown": float(max(m.get("max_drawdown", 0) for m in tms)),
+            "sharpe": float(np.median([m.get("sharpe", 0) for m in tms])),
+            "total_return": float(np.median([m.get("total_return", 0) for m in tms])),
+            "avg_r": float(np.median([m.get("avg_r", 0) for m in tms])),
+            "trades": int(sum(m.get("trades", 0) for m in tms)),
+            "folds": len(tms),
+            "profitable_windows": float(np.mean([pf > 1.0 for pf in pfs])),
+            "param_stability": 1.0}
+
 def _quant_candidates(symbols: list[str], interval: str, offline: bool,
                       errors: list[str]) -> tuple[list[Candidate], list[dict]]:
     candidates: list[Candidate] = []
@@ -89,6 +124,8 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{symbol}: data load failed: {exc}")
             continue
+        for issue in validate(df, interval):
+            errors.append(f"{symbol} data quality: {issue}")
         current_atr = float(atr(df["high"], df["low"], df["close"]).iloc[-1])
         price = float(df["close"].iloc[-1])
 
@@ -119,18 +156,27 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
                 stop=price - risk, target=price + BT_KW["rr"] * risk,
                 atr=current_atr, metrics=wf.test_metrics))
 
-        # ML signal: fit on 70%, signals only on the held-out 30%
+        # ML signal: same rolling walk-forward windows as the rule
+        # strategies - refit per fold, held-out evaluation only
         try:
+            ml_metrics = _ml_walk_forward(df, interval, bt_kwargs=BT_KW)
             sig = ml_signal(df)
-            if sig.iloc[-1] >= 1.0:
-                res = run(df, sig, interval=interval, **BT_KW)
+            if ml_metrics is not None:
+                leaderboard.append({
+                    "symbol": symbol, "strategy": "ml_logistic",
+                    "win_rate": round(ml_metrics.get("win_rate", 0), 3),
+                    "profit_factor": round(ml_metrics.get("profit_factor", 0), 2),
+                    "max_drawdown": round(ml_metrics.get("max_drawdown", 0), 3),
+                    "trades": ml_metrics.get("trades", 0),
+                    "signal_now": "live" if sig.iloc[-1] >= 1.0 else "flat"})
+            if ml_metrics is not None and sig.iloc[-1] >= 1.0:
                 risk = BT_KW["stop_atr"] * current_atr
                 candidates.append(Candidate(
                     index=len(candidates), symbol=symbol, interval=interval,
                     strategy="ml_logistic", params={"horizon": 5, "threshold": 0.55},
                     entry=price, stop=price - risk,
                     target=price + BT_KW["rr"] * risk, atr=current_atr,
-                    metrics=res.metrics()))
+                    metrics=ml_metrics))
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{symbol}/ml: failed: {exc}")
     return candidates, leaderboard
@@ -155,6 +201,48 @@ def _quant_summary(symbols: list[str], interval: str, offline: bool) -> dict:
     return out
 
 
+
+
+def _clean_str_dict(v) -> dict:
+    """Keep only int-coercible keys mapping to strings."""
+    if not isinstance(v, dict):
+        return {}
+    out = {}
+    for k, val in v.items():
+        if str(k).lstrip("-").isdigit() and isinstance(val, str):
+            out[str(k)] = val
+    return out
+
+
+def validate_llm(prompt_name: str, parsed: dict) -> dict:
+    """Strict shape checking for council responses. A malformed field is
+    dropped, never passed downstream - models write prose, code owns math."""
+    if not isinstance(parsed, dict):
+        return {}
+    if prompt_name == "analyst.md":
+        return {k: v for k, v in parsed.items() if isinstance(v, str)}
+    if prompt_name == "strategist.md":
+        ranked = parsed.get("ranked", "all")
+        if ranked != "all":
+            if not isinstance(ranked, list):
+                ranked = "all"
+            else:
+                ranked = [int(i) for i in ranked
+                          if isinstance(i, (int, float, str)) and str(i).lstrip("-").isdigit() and int(i) >= 0]
+        return {"ranked": ranked, "thesis": _clean_str_dict(parsed.get("thesis"))}
+    if prompt_name == "risk.md":
+        approved = parsed.get("approved", [])
+        if not isinstance(approved, list):
+            approved = []
+        notes = parsed.get("notes", "")
+        return {"vetoes": _clean_str_dict(parsed.get("vetoes")),
+                "approved": [int(i) for i in approved
+                             if isinstance(i, (int, float, str)) and str(i).lstrip("-").isdigit()],
+                "notes": notes if isinstance(notes, str) else ""}
+    if prompt_name == "critic.md":
+        return {"bear_case": _clean_str_dict(parsed.get("bear_case"))}
+    return parsed
+
 def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict,
          raw_as: str | None = None) -> dict:
     if model is None:
@@ -166,7 +254,7 @@ def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict,
     ])
     parsed = parse_json(resp.content)
     if parsed:
-        return parsed
+        return validate_llm(prompt_name, parsed)
     text = resp.content.strip()
     if raw_as and text:
         return {raw_as: text[:1500]}

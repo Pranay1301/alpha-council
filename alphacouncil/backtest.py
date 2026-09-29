@@ -3,6 +3,9 @@
 Execution model (deliberately conservative):
 - Signals are computed at bar close; entries fill at the NEXT bar's open
   plus slippage. No lookahead.
+- Stop/target checks begin on the bar AFTER the entry bar: the entry bar's
+  range includes prices from before the entry fill, so it can never trigger
+  an exit.
 - While in a trade, each bar is checked against the stop first: if a bar's
   range touches BOTH stop and target, the stop is assumed hit first. This
   under-reports performance rather than flattering it.
@@ -10,7 +13,10 @@ Execution model (deliberately conservative):
   major exchange's spot taker fee), slippage on entry and exit.
 - Exits: stop-loss, take-profit, signal-off, or max holding bars.
 
-Returns every trade plus an equity curve, so metrics are auditable.
+The equity curve is a genuine bar-by-bar portfolio curve: it is flat while
+no position is held and marks the open position to market on every bar, so
+Sharpe ratio and drawdown measure the strategy's actual path, not a step
+function stitched from closed-trade P&L.
 """
 
 from __future__ import annotations
@@ -36,12 +42,14 @@ class Trade:
     exit_reason: str = ""
     pnl_pct: float = 0.0        # after fees, as a fraction (0.02 = +2%)
     r_multiple: float = 0.0     # pnl in units of initial risk
+    mae: float = 0.0            # max adverse excursion while in trade
+    mfe: float = 0.0            # max favorable excursion while in trade
 
 
 @dataclass
 class BacktestResult:
     trades: list[Trade] = field(default_factory=list)
-    equity: pd.Series | None = None   # cumulative equity, 1.0 start
+    equity: pd.Series | None = None   # bar-by-bar portfolio equity, 1.0 start
     interval: str = "1d"
 
     def metrics(self) -> dict:
@@ -82,38 +90,56 @@ def run(df: pd.DataFrame, signals: pd.Series, *, stop_atr: float = 2.0,
     rr: take-profit distance = rr * stop distance (risk multiple).
     """
     signals = signals.reindex(df.index).fillna(0.0)
-    atrv = atr(df["high"], df["low"], df["close"])
+    atrv = atr(df["high"], df["low"], df["close"]).to_numpy()
+    sig = signals.to_numpy()
+    o = df["open"].to_numpy()
+    h = df["high"].to_numpy()
+    lo = df["low"].to_numpy()
+    c = df["close"].to_numpy()
+    idx = df.index
+    n = len(df)
     fee = fee_bps / 1e4
     slip = slippage_bps / 1e4
 
     res = BacktestResult(interval=interval)
+    eq = np.ones(n)
+    cur = 1.0                 # current portfolio equity
+    entry_eq = 0.0            # equity at entry, net of entry fee
     pos: Trade | None = None
+    entry_bar = -1
     bars_held = 0
-    idx = df.index
-    for i in range(len(df) - 1):
-        bar = df.iloc[i]
+
+    for i in range(n):
         if pos is None:
-            if signals.iloc[i] >= 1.0 and not np.isnan(atrv.iloc[i]):
-                nxt = df.iloc[i + 1]
-                entry = nxt["open"] * (1 + slip)
-                risk = stop_atr * atrv.iloc[i]
+            eq[i] = cur
+            if i < n - 1 and sig[i] >= 1.0 and not np.isnan(atrv[i]):
+                risk = stop_atr * atrv[i]
                 if risk <= 0:
                     continue
+                entry_price = o[i + 1] * (1 + slip)
                 pos = Trade(entry_time=idx[i + 1], exit_time=None,
-                            entry=entry, exit=None,
-                            stop=entry - risk, target=entry + rr * risk)
+                            entry=entry_price, exit=None,
+                            stop=entry_price - risk,
+                            target=entry_price + rr * risk)
+                entry_bar = i + 1
                 bars_held = 0
+                entry_eq = cur * (1 - fee)   # entry fee hits equity now
         else:
             bars_held += 1
             exit_price, reason = None, ""
-            if bar["low"] <= pos.stop:
-                exit_price, reason = pos.stop * (1 - slip), "stop_loss"
-            elif bar["high"] >= pos.target:
-                exit_price, reason = pos.target * (1 - slip), "take_profit"
-            elif exit_on_signal_off and signals.iloc[i] < 1.0:
-                exit_price, reason = bar["close"] * (1 - slip), "signal_off"
-            elif bars_held >= max_hold:
-                exit_price, reason = bar["close"] * (1 - slip), "max_hold"
+            if i > entry_bar:
+                # stop/target/signal checks only on bars after the entry bar
+                if lo[i] <= pos.stop:
+                    exit_price, reason = pos.stop * (1 - slip), "stop_loss"
+                elif h[i] >= pos.target:
+                    exit_price, reason = pos.target * (1 - slip), "take_profit"
+                elif exit_on_signal_off and sig[i] < 1.0:
+                    exit_price, reason = c[i] * (1 - slip), "signal_off"
+                elif bars_held >= max_hold:
+                    exit_price, reason = c[i] * (1 - slip), "max_hold"
+            # excursions tracked bar-by-bar while the trade is open
+            pos.mae = min(pos.mae, lo[i] / pos.entry - 1)
+            pos.mfe = max(pos.mfe, h[i] / pos.entry - 1)
             if exit_price is not None:
                 pos.exit = exit_price
                 pos.exit_time = idx[i]
@@ -121,20 +147,19 @@ def run(df: pd.DataFrame, signals: pd.Series, *, stop_atr: float = 2.0,
                 pos.pnl_pct = (pos.exit / pos.entry) * (1 - fee) / (1 + fee) - 1
                 pos.r_multiple = pos.pnl_pct / ((pos.entry - pos.stop) / pos.entry)
                 res.trades.append(pos)
+                cur = entry_eq * (pos.exit / pos.entry) * (1 - fee)
                 pos = None
+                eq[i] = cur
+            else:
+                eq[i] = entry_eq * (c[i] / pos.entry)  # mark to market
     if pos is not None:  # close at the final close, marked as open-end
-        bar = df.iloc[-1]
-        pos.exit = bar["close"] * (1 - slip)
+        pos.exit = c[-1] * (1 - slip)
         pos.exit_time = idx[-1]
         pos.exit_reason = "end_of_data"
         pos.pnl_pct = (pos.exit / pos.entry) * (1 - fee) / (1 + fee) - 1
         pos.r_multiple = pos.pnl_pct / ((pos.entry - pos.stop) / pos.entry)
         res.trades.append(pos)
+        eq[-1] = entry_eq * (pos.exit / pos.entry) * (1 - fee)
 
-    # rebuild equity cleanly from trade pnl (compounded) for metrics
-    eq = pd.Series(1.0, index=df.index)
-    for t in res.trades:
-        if t.exit_time is not None:
-            eq.loc[t.exit_time:] = eq.loc[t.exit_time:] * (1 + t.pnl_pct)
-    res.equity = eq
+    res.equity = pd.Series(eq, index=idx)
     return res

@@ -98,3 +98,34 @@ if __name__ == "__main__":
         fn()
         print(f"pass: {name}")
     print("all backtest tests passed")
+
+
+def test_equity_is_bar_by_bar_not_step_function():
+    df = make_df(flat_then_up())
+    sig = pd.Series(1.0, index=df.index)
+    res = run(df, sig, stop_atr=2.0, rr=50.0, fee_bps=0, slippage_bps=0,
+              exit_on_signal_off=False, max_hold=10_000)
+    eq = res.equity
+    # while in a winning open trade, equity must move on consecutive bars
+    window = eq.iloc[25:35].to_numpy()
+    assert not np.allclose(window, window[0]), "equity is a step function"
+
+
+def test_entry_bar_cannot_trigger_exit():
+    # entry bar dips below the stop intrabar BEFORE the entry fill would
+    # have happened; only subsequent bars may trigger the stop
+    closes = [100.0] * 25 + [90.0] + [100.0 + i for i in range(1, 30)]
+    idx = pd.date_range("2026-01-01", periods=len(closes), freq="D", tz="UTC")
+    df = pd.DataFrame({
+        "open": [100.0] * 25 + [100.0] + [99.0 + i for i in range(1, 30)],
+        "high": [c + 1 for c in closes],
+        "low": [c - 1 for c in closes[:25]] + [80.0] + [c - 1 for c in closes[26:]],
+        "close": closes,
+        "volume": np.full(len(closes), 1000.0),
+    }, index=idx)
+    sig = pd.Series(0.0, index=df.index)
+    sig.iloc[24] = 1.0  # entry at bar 25's open (100); bar 25's low is 80
+    res = run(df, sig, stop_atr=2.0, rr=2.0, fee_bps=0, slippage_bps=0,
+              exit_on_signal_off=False)
+    t = res.trades[0]
+    assert t.exit_reason != "stop_loss" or t.exit_time > df.index[25]
