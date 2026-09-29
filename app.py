@@ -80,12 +80,29 @@ if run and symbols:
         if bits:
             st.caption(" \u00b7 ".join(bits))
 
+    st.subheader("Market overview")
+    ov_rows = []
+    for s in res.symbols:
+        dd = res.regime.get(s, {}) if isinstance(res.regime, dict) else {}
+        n_ok = len([c for c in res.candidates if c.symbol == s and not c.vetoed])
+        ov_rows.append({"Coin": s, "Regime": dd.get("regime", "-"),
+                        "Trend (EMA20/50)": dd.get("ema20_vs_ema50", "-"),
+                        "ATR %": dd.get("atr_pct", "-"),
+                        "Approved setups": n_ok})
+    st.dataframe(pd.DataFrame(ov_rows), use_container_width=True, hide_index=True)
+
     approved = [c for c in res.candidates if not c.vetoed]
     vetoed = [c for c in res.candidates if c.vetoed]
 
     st.subheader(f"Trade suggestions ({len(approved)})")
     if not approved:
-        st.info("No live setups passed risk policy. No suggestion IS the suggestion.")
+        st.error("NO ACTIONABLE SETUPS")
+        for c in vetoed:
+            st.markdown(f"- **{c.symbol}** `{c.strategy}` - rejected: {c.vetoed}")
+        if not vetoed:
+            st.markdown("No live signals on any selected coin.")
+        st.caption("The desk found no setup meeting the current research "
+                   "policy. No suggestion IS the suggestion.")
     for c in approved:
         m = c.metrics
         rr = (c.target - c.entry) / max(c.entry - c.stop, 1e-12)
@@ -109,6 +126,32 @@ if run and symbols:
                 st.markdown(f"**Thesis (strategist):** {c.thesis}")
             if c.bear_case:
                 st.markdown(f"**Bear case (critic):** {c.bear_case}")
+            with st.expander("Why this setup exists"):
+                dd = res.regime.get(c.symbol, {}) if isinstance(res.regime, dict) else {}
+                st.markdown(f"**Signal** `{c.strategy}` \u00b7 current regime `{c.regime or '?'}`")
+                st.markdown(f"**Why now**  \u2713 EMA20 {dd.get('ema20_vs_ema50', '?')} EMA50 "
+                            f"\u00b7 \u2713 ATR {dd.get('atr_pct', '?')}% of price "
+                            f"\u00b7 \u2713 signal live on the last bar")
+                st.markdown(f"**Backtest evidence**  \u2713 {m.get('folds', '?')} rolling windows "
+                            f"\u00b7 \u2713 {m.get('trades', '?')} OOS trades "
+                            f"\u00b7 \u2713 median PF {m.get('profit_factor', 0):.2f} "
+                            f"\u00b7 \u2713 median Sharpe {m.get('sharpe', 0):.2f} "
+                            f"\u00b7 \u2713 worst DD {m.get('max_drawdown', 0):.0%} "
+                            f"\u00b7 \u2713 {m.get('profitable_windows', 0):.0%} profitable windows "
+                            f"\u00b7 \u2713 param stability {m.get('param_stability', 0):.0%}")
+                if c.regime_stats:
+                    def _pfkey(kv):
+                        pf = kv[1]["profit_factor"]
+                        return pf if pf != float("inf") else 99.0
+                    best_reg = max(c.regime_stats.items(), key=_pfkey)
+                    st.markdown(f"**Regime fit**  past edge concentrated in "
+                                f"`{best_reg[0]}` (PF {best_reg[1]['profit_factor']:.2f} "
+                                f"over {best_reg[1]['trades']} trades)")
+                st.markdown("**Council**")
+                st.text(f"Analyst     -> {res.market_view[:180]}")
+                st.text(f"Strategist  -> {(c.thesis or 'no thesis')[:180]}")
+                st.text(f"Risk        -> no veto (passed hard policy)")
+                st.text(f"Critic      -> {(c.bear_case or 'no objection')[:180]}")
             try:
                 df = load(c.symbol, interval, offline=not live)
                 st.line_chart(df["close"].tail(120), height=180)

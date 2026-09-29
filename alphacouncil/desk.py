@@ -20,6 +20,7 @@ import pandas as pd
 
 from .backtest import run
 from .data import load, validate
+from .regime import classify, trades_by_regime
 from .indicators import atr, ema, rsi
 from .ml import ml_signal
 from .model import MockModel, Model, parse_json
@@ -54,6 +55,8 @@ class Candidate:
     thesis: str = ""
     bear_case: str = ""
     vetoed: str = ""
+    regime: str = ""
+    regime_stats: dict = field(default_factory=dict)
 
     def to_json(self) -> dict:
         return {"index": self.index, "symbol": self.symbol,
@@ -147,6 +150,9 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
                 "max_drawdown": round(tm.get("max_drawdown", 0), 3),
                 "trades": tm.get("trades", 0),
                 "signal_now": "live" if sig_now >= 1.0 else "flat"})
+            labels = classify(df)
+            full_bt = run(df, fn(df, **wf.best_params), interval=interval, **BT_KW)
+            reg_stats = trades_by_regime(df, full_bt.trades)
             if sig_now < 1.0:
                 continue  # only suggest setups that are live right now
             risk = BT_KW["stop_atr"] * current_atr
@@ -154,7 +160,8 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
                 index=len(candidates), symbol=symbol, interval=interval,
                 strategy=name, params=wf.best_params, entry=price,
                 stop=price - risk, target=price + BT_KW["rr"] * risk,
-                atr=current_atr, metrics=wf.test_metrics))
+                atr=current_atr, metrics=wf.test_metrics,
+                regime=str(labels.iloc[-1]), regime_stats=reg_stats))
 
         # ML signal: same rolling walk-forward windows as the rule
         # strategies - refit per fold, held-out evaluation only
@@ -266,6 +273,11 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
     errors: list[str] = []
     candidates, leaderboard = _quant_candidates(symbols, interval, offline, errors)
     summary = _quant_summary(symbols, interval, offline)
+    for s in symbols:
+        try:
+            summary[s]["regime"] = str(classify(load(s, interval, offline=offline)).iloc[-1])
+        except Exception:  # noqa: BLE001
+            pass
     summary["interval"] = interval
     summary["live_candidates"] = len(candidates)
 
