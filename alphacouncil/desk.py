@@ -74,11 +74,15 @@ class DeskResult:
     interval: str
     live: bool
     errors: list[str] = field(default_factory=list)
+    leaderboard: list[dict] = field(default_factory=list)
+    council_log: list[dict] = field(default_factory=list)
+    regime: dict = field(default_factory=dict)
 
 
 def _quant_candidates(symbols: list[str], interval: str, offline: bool,
-                      errors: list[str]) -> list[Candidate]:
+                      errors: list[str]) -> tuple[list[Candidate], list[dict]]:
     candidates: list[Candidate] = []
+    leaderboard: list[dict] = []
     for symbol in symbols:
         try:
             df = load(symbol, interval, offline=offline)
@@ -98,6 +102,14 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
             if wf is None:
                 continue
             sig_now = float(fn(df, **wf.best_params).iloc[-1])
+            tm = wf.test_metrics
+            leaderboard.append({
+                "symbol": symbol, "strategy": name,
+                "win_rate": round(tm.get("win_rate", 0), 3),
+                "profit_factor": round(tm.get("profit_factor", 0), 2),
+                "max_drawdown": round(tm.get("max_drawdown", 0), 3),
+                "trades": tm.get("trades", 0),
+                "signal_now": "live" if sig_now >= 1.0 else "flat"})
             if sig_now < 1.0:
                 continue  # only suggest setups that are live right now
             risk = BT_KW["stop_atr"] * current_atr
@@ -121,7 +133,7 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
                     metrics=res.metrics()))
         except Exception as exc:  # noqa: BLE001
             errors.append(f"{symbol}/ml: failed: {exc}")
-    return candidates
+    return candidates, leaderboard
 
 
 def _quant_summary(symbols: list[str], interval: str, offline: bool) -> dict:
@@ -143,7 +155,8 @@ def _quant_summary(symbols: list[str], interval: str, offline: bool) -> dict:
     return out
 
 
-def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict) -> dict:
+def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict,
+         raw_as: str | None = None) -> dict:
     if model is None:
         return fallback
     system = (PROMPTS_DIR / prompt_name).read_text()
@@ -152,19 +165,24 @@ def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict) -
         {"role": "user", "content": json.dumps(payload, indent=2)},
     ])
     parsed = parse_json(resp.content)
-    return parsed or fallback
+    if parsed:
+        return parsed
+    text = resp.content.strip()
+    if raw_as and text:
+        return {raw_as: text[:1500]}
+    return fallback
 
 
 def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
              model: Model | None = None) -> DeskResult:
     errors: list[str] = []
-    candidates = _quant_candidates(symbols, interval, offline, errors)
+    candidates, leaderboard = _quant_candidates(symbols, interval, offline, errors)
     summary = _quant_summary(symbols, interval, offline)
     summary["interval"] = interval
     summary["live_candidates"] = len(candidates)
 
     analyst = _ask(model, "analyst.md", summary,
-                   {"market_view": ""})
+                   {"market_view": ""}, raw_as="market_view")
     market_view = analyst.get("market_view") or analyst.get("reason") or ""
     if not market_view and model is None:
         market_view = "(no model attached - quant-only run)"
@@ -215,8 +233,18 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
         if str(k).isdigit() and int(k) in approved_idx:
             approved_idx[int(k)].bear_case = v
 
+    council_log = [
+        {"stage": "analyst - market view", "output": market_view or "(no market view)"},
+        {"stage": "strategist - ranking and theses",
+         "output": json.dumps(strat, indent=2)[:3000]},
+        {"stage": "risk manager - vetoes and notes",
+         "output": json.dumps(risk, indent=2)[:3000]},
+        {"stage": "critic - bear cases",
+         "output": json.dumps(critic, indent=2)[:3000]},
+    ]
     return DeskResult(market_view=market_view, candidates=candidates,
                       risk_notes=risk.get("notes", ""), symbols=symbols,
                       interval=interval,
                       live=model is not None and not isinstance(model, MockModel),
-                      errors=errors)
+                      errors=errors, leaderboard=leaderboard,
+                      council_log=council_log, regime=summary)

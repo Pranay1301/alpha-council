@@ -11,6 +11,7 @@ Suggestions only - not financial advice.
 
 from __future__ import annotations
 
+import pandas as pd
 import streamlit as st
 
 from alphacouncil.data import KRAKEN_PAIRS, load
@@ -19,6 +20,13 @@ from alphacouncil.disclaimers import FULL, SHORT
 from alphacouncil.report import render_markdown
 
 st.set_page_config(page_title="alpha-council", page_icon="📊", layout="wide")
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _track_record(symbols: tuple, interval: str, offline: bool):
+    from alphacouncil.trackrecord import replay, summary
+    rows = replay(list(symbols), interval, offline)
+    return rows, summary(rows)
 
 st.title("alpha-council")
 st.caption("An AI research desk for crypto. LLM agents propose, rank and "
@@ -63,6 +71,14 @@ if run and symbols:
 
     st.subheader("Market view")
     st.write(res.market_view)
+    if res.regime:
+        bits = []
+        for s, d in res.regime.items():
+            if isinstance(d, dict) and "ema20_vs_ema50" in d:
+                bits.append(f"**{s}**: EMA20 {d['ema20_vs_ema50']} EMA50 "
+                            f"\u00b7 ATR {d.get('atr_pct', '?')}%")
+        if bits:
+            st.caption(" \u00b7 ".join(bits))
 
     approved = [c for c in res.candidates if not c.vetoed]
     vetoed = [c for c in res.candidates if c.vetoed]
@@ -110,6 +126,35 @@ if run and symbols:
         with st.expander("Pipeline warnings"):
             for e in res.errors:
                 st.text(e)
+
+    if res.leaderboard:
+        st.subheader("Strategy leaderboard (out-of-sample)")
+        lb = pd.DataFrame(res.leaderboard).sort_values(
+            "profit_factor", ascending=False)
+        st.dataframe(lb, use_container_width=True, hide_index=True)
+
+    if res.council_log:
+        with st.expander("Full council debate"):
+            for stage in res.council_log:
+                st.markdown(f"**{stage['stage']}**")
+                st.text(stage["output"][:2000])
+
+    st.subheader("Track record - the desk grades its own calls")
+    st.caption("The quant engine replayed at past checkpoints on the data "
+               "it would have seen then, graded against what price did "
+               "next. Backtested replay, not live trading results.")
+    with st.spinner("Grading past signals..."):
+        tr_rows, tr_sum = _track_record(tuple(sorted(symbols)), interval,
+                                        not live)
+    if tr_rows:
+        st.caption(f"{tr_sum['calls']} replayed calls \u00b7 "
+                   f"{tr_sum['wins']}/{tr_sum['graded']} graded wins "
+                   f"({tr_sum['win_rate']:.0%}) \u00b7 "
+                   f"avg return {tr_sum['avg_return_pct']}%")
+        st.dataframe(pd.DataFrame(tr_rows), use_container_width=True,
+                     hide_index=True)
+    else:
+        st.info("No signals fired at the replay checkpoints.")
 
     st.divider()
     st.download_button("Download report (markdown)", render_markdown(res),
