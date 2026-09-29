@@ -47,6 +47,11 @@ if run and symbols:
         import os
         from alphacouncil.model import FREE_PROVIDERS, OpenAIModel
         if not api_key:
+            try:
+                api_key = st.secrets.get("GROQ_API_KEY", "")
+            except Exception:
+                api_key = ""
+        if not api_key:
             st.error("Live council needs an API key (free tier is fine).")
             st.stop()
         base_url, default_model, _ = FREE_PROVIDERS[provider]
