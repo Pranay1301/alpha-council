@@ -1,0 +1,222 @@
+"""The research desk: quant pipeline + agent council.
+
+Two layers, strictly separated:
+1. Quant (code, no LLM): data -> indicators -> strategies -> walk-forward
+   backtests -> candidate setups with entry/stop/target and out-of-sample
+   metrics. The LLM never sees raw price data and never computes numbers.
+2. Council (LLM agents): analyst, strategist, risk manager, critic. They
+   narrate, rank, veto, and attack the candidates - but every number on a
+   final card comes from layer 1. This is how the tool stays honest:
+   models write prose, code owns math.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import pandas as pd
+
+from .backtest import run
+from .data import load
+from .indicators import atr, ema, rsi
+from .ml import ml_signal
+from .model import MockModel, Model, parse_json
+from .optimize import walk_forward
+from .strategies import STRATEGIES
+
+PROMPTS_DIR = Path(__file__).resolve().parent.parent / "prompts"
+
+PARAM_GRIDS = {
+    "trend_following": {"fast": [10, 20], "slow": [40, 50], "rsi_cap": [65.0, 70.0]},
+    "mean_reversion": {"rsi_window": [14], "oversold": [25.0, 30.0], "window": [20]},
+    "breakout": {"lookback": [15, 20], "vol_mult": [1.2, 1.5]},
+}
+BT_KW = {"stop_atr": 2.0, "rr": 2.0, "fee_bps": 10.0, "slippage_bps": 5.0}
+MIN_TEST_PF = 1.0
+MIN_TEST_TRADES = 4
+MAX_TEST_DD = 0.35
+
+
+@dataclass
+class Candidate:
+    index: int
+    symbol: str
+    interval: str
+    strategy: str
+    params: dict
+    entry: float
+    stop: float
+    target: float
+    atr: float
+    metrics: dict          # out-of-sample (test window) metrics
+    thesis: str = ""
+    bear_case: str = ""
+    vetoed: str = ""
+
+    def to_json(self) -> dict:
+        return {"index": self.index, "symbol": self.symbol,
+                "strategy": self.strategy, "params": self.params,
+                "entry": round(self.entry, 4), "stop": round(self.stop, 4),
+                "target": round(self.target, 4),
+                "risk_reward": round((self.target - self.entry) / max(self.entry - self.stop, 1e-12), 2),
+                "test_metrics": {k: (round(v, 4) if isinstance(v, float) else v)
+                                 for k, v in self.metrics.items()}}
+
+
+@dataclass
+class DeskResult:
+    market_view: str
+    candidates: list[Candidate]
+    risk_notes: str
+    symbols: list[str]
+    interval: str
+    live: bool
+    errors: list[str] = field(default_factory=list)
+
+
+def _quant_candidates(symbols: list[str], interval: str, offline: bool,
+                      errors: list[str]) -> list[Candidate]:
+    candidates: list[Candidate] = []
+    for symbol in symbols:
+        try:
+            df = load(symbol, interval, offline=offline)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{symbol}: data load failed: {exc}")
+            continue
+        current_atr = float(atr(df["high"], df["low"], df["close"]).iloc[-1])
+        price = float(df["close"].iloc[-1])
+
+        for name, fn in STRATEGIES.items():
+            try:
+                wf = walk_forward(df, name, fn, PARAM_GRIDS[name],
+                                  interval=interval, bt_kwargs=BT_KW)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(f"{symbol}/{name}: walk-forward failed: {exc}")
+                continue
+            if wf is None:
+                continue
+            sig_now = float(fn(df, **wf.best_params).iloc[-1])
+            if sig_now < 1.0:
+                continue  # only suggest setups that are live right now
+            risk = BT_KW["stop_atr"] * current_atr
+            candidates.append(Candidate(
+                index=len(candidates), symbol=symbol, interval=interval,
+                strategy=name, params=wf.best_params, entry=price,
+                stop=price - risk, target=price + BT_KW["rr"] * risk,
+                atr=current_atr, metrics=wf.test_metrics))
+
+        # ML signal: fit on 70%, signals only on the held-out 30%
+        try:
+            sig = ml_signal(df)
+            if sig.iloc[-1] >= 1.0:
+                res = run(df, sig, interval=interval, **BT_KW)
+                risk = BT_KW["stop_atr"] * current_atr
+                candidates.append(Candidate(
+                    index=len(candidates), symbol=symbol, interval=interval,
+                    strategy="ml_logistic", params={"horizon": 5, "threshold": 0.55},
+                    entry=price, stop=price - risk,
+                    target=price + BT_KW["rr"] * risk, atr=current_atr,
+                    metrics=res.metrics()))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{symbol}/ml: failed: {exc}")
+    return candidates
+
+
+def _quant_summary(symbols: list[str], interval: str, offline: bool) -> dict:
+    out = {}
+    for symbol in symbols:
+        try:
+            df = load(symbol, interval, offline=offline)
+        except Exception:  # noqa: BLE001
+            continue
+        close = df["close"]
+        out[symbol] = {
+            "price": round(float(close.iloc[-1]), 4),
+            "change_7b_pct": round(float(close.iloc[-1] / close.iloc[-8] - 1) * 100, 2) if len(close) > 8 else None,
+            "change_30b_pct": round(float(close.iloc[-1] / close.iloc[-31] - 1) * 100, 2) if len(close) > 31 else None,
+            "rsi14": round(float(rsi(close).iloc[-1]), 1),
+            "ema20_vs_ema50": "above" if ema(close, 20).iloc[-1] > ema(close, 50).iloc[-1] else "below",
+            "atr_pct": round(float(atr(df["high"], df["low"], close).iloc[-1] / close.iloc[-1]) * 100, 2),
+        }
+    return out
+
+
+def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict) -> dict:
+    if model is None:
+        return fallback
+    system = (PROMPTS_DIR / prompt_name).read_text()
+    resp = model.complete([
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(payload, indent=2)},
+    ])
+    parsed = parse_json(resp.content)
+    return parsed or fallback
+
+
+def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
+             model: Model | None = None) -> DeskResult:
+    errors: list[str] = []
+    candidates = _quant_candidates(symbols, interval, offline, errors)
+    summary = _quant_summary(symbols, interval, offline)
+    summary["interval"] = interval
+    summary["live_candidates"] = len(candidates)
+
+    analyst = _ask(model, "analyst.md", summary,
+                   {"market_view": ""})
+    market_view = analyst.get("market_view") or analyst.get("reason") or ""
+    if not market_view and model is None:
+        market_view = "(no model attached - quant-only run)"
+    elif not market_view:
+        market_view = next((v for v in analyst.values() if isinstance(v, str)), "")
+
+    payload = {"candidates": [c.to_json() for c in candidates]}
+    strat = _ask(model, "strategist.md", payload, {"ranked": "all", "thesis": {}})
+    # thesis keys refer to the ORIGINAL indices in payload - apply before reordering
+    for k, v in (strat.get("thesis") or {}).items():
+        if str(k).isdigit() and int(k) in {c.index for c in candidates}:
+            by_index_all = {c.index: c for c in candidates}
+            by_index_all[int(k)].thesis = v
+    ranked = strat.get("ranked", "all")
+    order = ([c.index for c in candidates] if ranked == "all"
+             else [int(i) for i in ranked if int(i) < len(candidates)])
+    by_index = {c.index: c for c in candidates}
+    candidates = [by_index[i] for i in order if i in by_index]
+    for i, c in enumerate(candidates):
+        c.index = i  # reindex in ranked order; payloads below use these
+
+    risk_payload = {"candidates": [c.to_json() for c in candidates]}
+    risk = _ask(model, "risk.md", risk_payload,
+                {"vetoes": {}, "approved": [c.index for c in candidates], "notes": ""})
+    # code enforces the risk policy too - the LLM's veto is advisory,
+    # the hard rules below are not
+    for c in candidates:
+        m = c.metrics
+        reasons = []
+        if m.get("profit_factor", 0) < MIN_TEST_PF:
+            reasons.append(f"test profit factor {m.get('profit_factor', 0):.2f} < {MIN_TEST_PF}")
+        if m.get("trades", 0) < MIN_TEST_TRADES:
+            reasons.append(f"only {m.get('trades', 0)} test trades")
+        if m.get("max_drawdown", 1) > MAX_TEST_DD:
+            reasons.append(f"test max drawdown {m.get('max_drawdown', 0):.0%} > {MAX_TEST_DD:.0%}")
+        if reasons:
+            c.vetoed = "; ".join(reasons)
+    for k, v in (risk.get("vetoes") or {}).items():
+        if str(k).isdigit() and int(k) < len(candidates) and not candidates[int(k)].vetoed:
+            candidates[int(k)].vetoed = f"risk manager: {v}"
+
+    approved = [c for c in candidates if not c.vetoed]
+    critic = _ask(model, "critic.md",
+                  {"candidates": [c.to_json() for c in approved]},
+                  {"bear_case": {}})
+    approved_idx = {c.index: c for c in approved}
+    for k, v in (critic.get("bear_case") or {}).items():
+        if str(k).isdigit() and int(k) in approved_idx:
+            approved_idx[int(k)].bear_case = v
+
+    return DeskResult(market_view=market_view, candidates=candidates,
+                      risk_notes=risk.get("notes", ""), symbols=symbols,
+                      interval=interval,
+                      live=model is not None and not isinstance(model, MockModel),
+                      errors=errors)

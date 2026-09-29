@@ -1,0 +1,9 @@
+# Core desk (required)
+numpy>=1.26
+pandas>=2.0
+
+# Live council (--live / dashboard toggle); not needed offline
+openai>=1.0
+
+# Dashboard only: streamlit run app.py
+streamlit>=1.30
