@@ -138,9 +138,9 @@ def validate(df: pd.DataFrame, interval: str = "1d") -> list[str]:
         issues.append("NaNs in OHLC")
     if (ohlc <= 0).any().any():
         issues.append("non-positive prices")
-    freq = pd.tseries.frequencies.to_offset("1D" if interval == "1d" else "1h")
+    step = pd.Timedelta(days=1) if interval == "1d" else pd.Timedelta(hours=1)
     gaps = df.index.to_series().diff().dropna()
-    missing = gaps[gaps > freq * 1.5]
+    missing = gaps[gaps > step * 1.5]
     if len(missing):
         issues.append(f"{len(missing)} missing-bar gaps")
     jumps = df["close"].pct_change().abs()
