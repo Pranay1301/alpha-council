@@ -30,12 +30,15 @@ from .backtest import BacktestResult, run
 @dataclass
 class WalkForwardResult:
     strategy: str
-    best_params: dict           # modal parameters across folds
+    best_params: dict           # modal parameters across folds = CURRENT LIVE
+                                # parameters; NOT the parameters behind the
+                                # aggregate test metrics (each fold used its own)
     train: BacktestResult
     test: BacktestResult
     train_metrics: dict
     test_metrics: dict          # aggregated across folds (see module docstring)
     fold_params: list[dict] = field(default_factory=list)
+    fold_test_metrics: list[dict] = field(default_factory=list)  # per-fold OOS
 
 
 def _score(m: dict) -> float:
@@ -123,4 +126,5 @@ def walk_forward(df: pd.DataFrame, strategy_name: str, strategy_fn,
     return WalkForwardResult(strategy_name, dict(modal_params),
                              train_res_list[-1], test_res_list[-1],
                              train_metrics, test_metrics,
-                             fold_params=[dict(p) for p in params_list])
+                             fold_params=[dict(p) for p in params_list],
+                             fold_test_metrics=[dict(m) for m in tms])

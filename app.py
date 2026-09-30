@@ -32,6 +32,12 @@ def _track_record(symbols: tuple, interval: str, offline: bool):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
+def _effectiveness_offline(symbols: tuple[str, ...], interval: str):
+    from alphacouncil.effectiveness import paired_replay
+    return paired_replay(list(symbols), interval, offline=True)
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
 def _offline_desk(symbols: tuple[str, ...], interval: str):
     # Cache deterministic offline quant; never cache a live LLM result or API key.
     return run_desk(list(symbols), interval, offline=True, model=None)
@@ -234,6 +240,18 @@ if run and symbols:
                             f"\u00b7 \u2713 worst DD {m.get('max_drawdown', 0):.0%} "
                             f"\u00b7 \u2713 {m.get('profitable_windows', 0):.0%} profitable windows "
                             f"\u00b7 \u2713 param stability {m.get('param_stability', 0):.0%}")
+                if c.fold_params and c.fold_metrics:
+                    fl = []
+                    for i, (fp, fm) in enumerate(zip(c.fold_params, c.fold_metrics), 1):
+                        fl.append(f"fold {i}: `{fp}` \u2192 PF {fm.get('profit_factor', 0):.2f}, "
+                                  f"win {fm.get('win_rate', 0):.0%}, "
+                                  f"DD {fm.get('max_drawdown', 0):.0%}, "
+                                  f"{fm.get('trades', 0)} trades")
+                    st.markdown("**Walk-forward evidence (each fold traded its own parameters)**  \n" + "  \n".join(fl))
+                    st.markdown(f"**Current live parameters:** `{c.params}` "
+                                f"(modal across folds; stability {m.get('param_stability', 0):.0%}). "
+                                "The aggregate OOS metrics above were produced by each fold's own "
+                                "parameters, not necessarily by these.")
                 if c.evidence:
                     ev = c.evidence
                     comp = " \u00b7 ".join(f"{k} {v:.2f}" for k, v in ev["components"].items())
@@ -271,6 +289,23 @@ if run and symbols:
                     "**Limits:** sample size, regime changes, flat transaction costs "
                     "and no funding or liquidity model. Historical results are not "
                     "a forecast. The replay below is not a live paper-trading ledger.")
+    with st.expander("Research integrity"):
+        st.markdown(
+            "\u2713 No lookahead - signals at bar close\n\n"
+            "\u2713 Next-bar-open execution with slippage\n\n"
+            "\u2713 Rolling out-of-sample validation (3 test windows)\n\n"
+            "\u2713 Conservative stop collision - a bar touching stop and target counts as a stop\n\n"
+            f"\u2713 Fees {BT_KW['fee_bps']:.0f} bps/side and slippage {BT_KW['slippage_bps']:.0f} bps included\n\n"
+            "\u2713 Data quality and freshness checked\n\n"
+            "\u2713 LLM cannot modify trade numbers - risk policy is code\n\n"
+            "\u2713 LLM outputs strictly schema-validated against the live candidate set\n\n"
+            "\u2713 Historical replay uses truncated data and the desk's exact decision policy\n\n"
+            "\u2713 One canonical execution function shared by backtester, replay and paper ledger\n\n"
+            "\u26a0 No liquidity model\n\n"
+            "\u26a0 No funding costs\n\n"
+            "\u26a0 Limited historical sample\n\n"
+            "\u26a0 Correlated assets - theme concentration not modeled\n\n"
+            "\u26a0 Replay and paper ledger are research artifacts, not observed live performance")
     if vetoed:
         with st.expander(f"Vetoed by risk policy ({len(vetoed)})"):
             for c in vetoed:
@@ -303,9 +338,13 @@ if run and symbols:
                          hide_index=True)
 
     st.subheader("Track record - the desk grades its own calls")
-    st.caption("The quant engine replayed at past checkpoints on the data "
-               "it would have seen then, graded against what price did "
-               "next. Backtested replay, not live trading results.")
+    st.caption("The desk's exact decision policy - candidate generation, hard "
+               "risk vetoes, evidence and portfolio layer - replayed at past "
+               "checkpoints on the data it would have seen then. No hindsight "
+               "strategy selection. Calls are graded with the same canonical "
+               "execution as the backtester: entry at the next bar's open plus "
+               "slippage, stop/target from the following bar, fees both sides. "
+               "Backtested replay, not live trading results.")
     with st.spinner("Grading past signals..."):
         tr_rows, tr_sum = _track_record(tuple(sorted(symbols)), interval,
                                         not live)
@@ -318,11 +357,86 @@ if run and symbols:
                    f"{tr_sum['profit_factor'] if tr_sum['profit_factor'] is not None else 'undefined (no losses)'}")
         st.dataframe(pd.DataFrame(tr_rows), width="stretch",
                      hide_index=True)
-        st.caption("MAE/MFE bound the move through the exit bar; intrabar order "
-                   "is unknown. This is retrospective replay, not a persistent "
+        st.caption("Returns are net of fees. MAE/MFE bound the move through the "
+                   "exit bar; intrabar order is unknown. A win is a positive net "
+                   "return. This is retrospective replay, not a persistent "
                    "paper-trading ledger or observed live performance.")
     else:
         st.info("No signals fired at the replay checkpoints.")
+
+    st.subheader("Paper ledger - prospective track record")
+    st.caption("Approved setups are snapshotted at signal time - parameters, "
+               "evidence, regime, council output - and resolved bar-by-bar with "
+               "the same execution rules as the backtester. Lifecycle: "
+               "NEW \u2192 ACTIVE \u2192 TARGET / STOP / EXPIRED. Stored as JSON in "
+               "the app filesystem: on free Streamlit hosting that filesystem "
+               "resets on redeploy or restart, so download the ledger below for "
+               "a durable record. Paper trades, not real ones.")
+    try:
+        import json as _json
+        from alphacouncil import paper
+        frames = {sym: load(sym, interval, offline=not live) for sym in res.symbols}
+        sig_day = max(str(f.index[-1])[:10] for f in frames.values() if len(f))
+        snaps = paper.snapshot_candidates(
+            approved, source=("live council" if res.live else "quant-only"),
+            interval=interval, signal_date=sig_day, risk_notes=res.risk_notes)
+        ledger = paper.load_ledger()
+        ledger, added = paper.merge_new(ledger, snaps)
+        ledger, resolved_n = paper.resolve(ledger, frames)
+        paper.save_ledger(ledger)
+        lsum = paper.ledger_summary(ledger)
+        if ledger:
+            st.caption(f"{len(ledger)} paper signals \u00b7 {lsum['open']} open \u00b7 "
+                       f"{lsum['closed']} resolved \u00b7 {lsum['wins']} wins "
+                       f"({lsum['win_rate']:.0%}) \u00b7 profit factor "
+                       f"{lsum['profit_factor'] if lsum['profit_factor'] is not None else 'undefined (no losses)'}")
+            cols = ["id", "symbol", "strategy", "status", "signal_date",
+                    "signal_close", "entry", "stop", "target", "exit",
+                    "return_pct", "mae_pct", "mfe_pct", "bars_held", "source"]
+            st.dataframe(pd.DataFrame(ledger)[[c for c in cols if c in ledger[0]]],
+                         width="stretch", hide_index=True)
+            st.download_button("Download paper ledger (JSON)",
+                               _json.dumps(ledger, indent=2, sort_keys=True),
+                               file_name="alpha-council-paper-ledger.json")
+        else:
+            st.info("No approved setups to record yet. The ledger fills "
+                    "automatically on runs that produce approved setups.")
+    except Exception as exc:  # noqa: BLE001 - the ledger must never break the desk
+        st.caption(f"Paper ledger unavailable: {exc}")
+
+    st.subheader("Council effectiveness - paired replay")
+    st.caption("Quant-only vs quant+council on identical historical "
+               "opportunities, same canonical execution. Descriptive on small "
+               "samples, not proof.")
+    with st.spinner("Running paired replay..."):
+        try:
+            from alphacouncil.effectiveness import paired_replay
+            if live:
+                eff = paired_replay(symbols, interval, offline=False, model=model)
+            else:
+                eff = _effectiveness_offline(tuple(sorted(symbols)), interval)
+            qm, cm = eff["quant_only"], eff["quant_council"]
+            eff_rows = []
+            for label, key in (("Approved", "approved"), ("Graded", "graded"),
+                               ("Wins", "wins"), ("Win rate", "win_rate"),
+                               ("Avg return %", "avg_return_pct"),
+                               ("Profit factor", "profit_factor"),
+                               ("Worst trade %", "worst_trade_pct"),
+                               ("False-positive rate", "false_positive_rate")):
+                qv, cv = qm[key], cm[key]
+                if isinstance(qv, float) and key in ("win_rate", "false_positive_rate"):
+                    qv, cv = f"{qv:.0%}", f"{cv:.0%}"
+                eff_rows.append({"Metric": label, "Quant-only": qv,
+                                 "Quant + council": cv})
+            st.dataframe(pd.DataFrame(eff_rows), width="stretch", hide_index=True)
+            st.caption(f"{eff['generated']} candidates generated at "
+                       f"{eff['checkpoints']} checkpoints \u00b7 {eff['quant_rejected']} "
+                       f"rejected by hard policy \u00b7 {eff['council_vetoes']} council vetoes "
+                       f"\u00b7 veto precision {eff['veto_precision']} \u00b7 "
+                       f"veto recall {eff['veto_recall']}")
+            st.caption(eff["note"] + ". " + eff["limits"])
+        except Exception as exc:  # noqa: BLE001
+            st.caption(f"Paired replay unavailable: {exc}")
 
     st.divider()
     st.download_button("Download report (markdown)", render_markdown(res),

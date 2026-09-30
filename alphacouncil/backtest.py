@@ -1,4 +1,9 @@
-"""Event-driven long-only backtester with stop-loss / take-profit exits.
+"""Event-driven long-only execution engine with stop-loss / take-profit exits.
+
+There is ONE canonical trade simulation here - simulate_trade() - and every
+consumer uses it: the backtester, the historical replay (trackrecord.py),
+the persistent paper ledger (paper.py) and the council-effectiveness study
+(effectiveness.py). Backtest and track record can never silently diverge.
 
 Execution model (deliberately conservative):
 - Signals are computed at bar close; entries fill at the NEXT bar's open
@@ -44,6 +49,14 @@ class Trade:
     r_multiple: float = 0.0     # pnl in units of initial risk
     mae: float = 0.0            # max adverse excursion while in trade
     mfe: float = 0.0            # max favorable excursion while in trade
+    bars_held: int = 0          # bars from entry bar through exit bar
+
+
+@dataclass
+class SimResult:
+    trade: Trade
+    entry_bar: int              # array position of the entry bar
+    exit_bar: int               # array position of the exit bar
 
 
 @dataclass
@@ -80,11 +93,89 @@ class BacktestResult:
         }
 
 
+def monitor_trade(entry: float, stop: float, target: float, entry_bar: int,
+                  h, lo, c, *, fee_bps: float = 10.0, slippage_bps: float = 5.0,
+                  max_hold: int = 30, sig=None, exit_on_signal_off: bool = True,
+                  index=None, entry_time=None) -> SimResult:
+    """Canonical trade monitoring: fixed entry/stop/target, walk bars forward.
+
+    Stop/target/signal checks begin on the bar AFTER entry_bar (the entry
+    bar's range predates the fill). A bar touching both stop and target
+    counts as a stop. MAE/MFE bound the move through the exit bar; intrabar
+    order is unknown, so those are bounds, not tick-level claims.
+
+    Used directly by the paper ledger (stored levels) and by simulate_trade
+    (levels derived from a signal bar). Never reimplement this loop elsewhere.
+    """
+    n = len(c)
+    fee = fee_bps / 1e4
+    slip = slippage_bps / 1e4
+    trade = Trade(entry_time=entry_time if entry_time is not None else (index[entry_bar] if index is not None else entry_bar),
+                  exit_time=None, entry=entry, exit=None,
+                  stop=stop, target=target)
+    for i in range(entry_bar, n):
+        bars_held = i - entry_bar + 1
+        exit_price, reason = None, ""
+        if i > entry_bar:
+            if lo[i] <= stop:
+                exit_price, reason = stop * (1 - slip), "stop_loss"
+            elif h[i] >= target:
+                exit_price, reason = target * (1 - slip), "take_profit"
+            elif exit_on_signal_off and sig is not None and sig[i] < 1.0:
+                exit_price, reason = c[i] * (1 - slip), "signal_off"
+            elif bars_held >= max_hold:
+                exit_price, reason = c[i] * (1 - slip), "max_hold"
+        trade.mae = min(trade.mae, lo[i] / entry - 1)
+        trade.mfe = max(trade.mfe, h[i] / entry - 1)
+        if exit_price is not None:
+            trade.exit = exit_price
+            trade.exit_time = index[i] if index is not None else i
+            trade.exit_reason = reason
+            trade.bars_held = bars_held
+            break
+    if trade.exit is None:  # still open at the end of the data: mark to last close
+        i = n - 1
+        trade.exit = c[i] * (1 - slip)
+        trade.exit_time = index[i] if index is not None else i
+        trade.exit_reason = "end_of_data"
+        trade.bars_held = i - entry_bar + 1
+    trade.pnl_pct = (trade.exit / trade.entry) * (1 - fee) / (1 + fee) - 1
+    risk_frac = (trade.entry - trade.stop) / trade.entry
+    trade.r_multiple = trade.pnl_pct / risk_frac if risk_frac > 0 else 0.0
+    return SimResult(trade=trade, entry_bar=entry_bar, exit_bar=i)
+
+
+def simulate_trade(o, h, lo, c, signal_bar: int, atr_value: float, *,
+                   stop_atr: float = 2.0, rr: float = 2.0, fee_bps: float = 10.0,
+                   slippage_bps: float = 5.0, max_hold: int = 30, sig=None,
+                   exit_on_signal_off: bool = True, index=None) -> SimResult | None:
+    """THE canonical trade: signal at `signal_bar`'s close, entry at the NEXT
+    bar's open + slippage, stop = entry - stop_atr*ATR(signal bar),
+    target = entry + rr*risk, then monitor_trade(). Returns None when the
+    signal bar has no next bar to enter on.
+    """
+    n = len(c)
+    entry_bar = signal_bar + 1
+    if entry_bar >= n:
+        return None
+    risk = stop_atr * atr_value
+    if risk <= 0 or np.isnan(risk):
+        return None
+    slip = slippage_bps / 1e4
+    entry = o[entry_bar] * (1 + slip)
+    return monitor_trade(entry, entry - risk, entry + rr * risk, entry_bar,
+                         h, lo, c, fee_bps=fee_bps, slippage_bps=slippage_bps,
+                         max_hold=max_hold, sig=sig,
+                         exit_on_signal_off=exit_on_signal_off, index=index)
+
+
 def run(df: pd.DataFrame, signals: pd.Series, *, stop_atr: float = 2.0,
         rr: float = 2.0, fee_bps: float = 10.0, slippage_bps: float = 5.0,
         max_hold: int = 30, exit_on_signal_off: bool = True,
         interval: str = "1d") -> BacktestResult:
-    """Backtest a long/flat signal series on an OHLCV frame.
+    """Backtest a long/flat signal series on an OHLCV frame. Every trade is
+    executed by simulate_trade() - the same function the replay and paper
+    ledger use.
 
     stop_atr: stop distance = stop_atr * ATR(14) at entry.
     rr: take-profit distance = rr * stop distance (risk multiple).
@@ -99,67 +190,34 @@ def run(df: pd.DataFrame, signals: pd.Series, *, stop_atr: float = 2.0,
     idx = df.index
     n = len(df)
     fee = fee_bps / 1e4
-    slip = slippage_bps / 1e4
 
     res = BacktestResult(interval=interval)
     eq = np.ones(n)
     cur = 1.0                 # current portfolio equity
-    entry_eq = 0.0            # equity at entry, net of entry fee
-    pos: Trade | None = None
-    entry_bar = -1
-    bars_held = 0
-
-    for i in range(n):
-        if pos is None:
-            eq[i] = cur
-            if i < n - 1 and sig[i] >= 1.0 and not np.isnan(atrv[i]):
-                risk = stop_atr * atrv[i]
-                if risk <= 0:
-                    continue
-                entry_price = o[i + 1] * (1 + slip)
-                pos = Trade(entry_time=idx[i + 1], exit_time=None,
-                            entry=entry_price, exit=None,
-                            stop=entry_price - risk,
-                            target=entry_price + rr * risk)
-                entry_bar = i + 1
-                bars_held = 0
-                entry_eq = cur * (1 - fee)   # entry fee hits equity now
-        else:
-            bars_held += 1
-            exit_price, reason = None, ""
-            if i > entry_bar:
-                # stop/target/signal checks only on bars after the entry bar
-                if lo[i] <= pos.stop:
-                    exit_price, reason = pos.stop * (1 - slip), "stop_loss"
-                elif h[i] >= pos.target:
-                    exit_price, reason = pos.target * (1 - slip), "take_profit"
-                elif exit_on_signal_off and sig[i] < 1.0:
-                    exit_price, reason = c[i] * (1 - slip), "signal_off"
-                elif bars_held >= max_hold:
-                    exit_price, reason = c[i] * (1 - slip), "max_hold"
-            # excursions tracked bar-by-bar while the trade is open
-            pos.mae = min(pos.mae, lo[i] / pos.entry - 1)
-            pos.mfe = max(pos.mfe, h[i] / pos.entry - 1)
-            if exit_price is not None:
-                pos.exit = exit_price
-                pos.exit_time = idx[i]
-                pos.exit_reason = reason
-                pos.pnl_pct = (pos.exit / pos.entry) * (1 - fee) / (1 + fee) - 1
-                pos.r_multiple = pos.pnl_pct / ((pos.entry - pos.stop) / pos.entry)
-                res.trades.append(pos)
-                cur = entry_eq * (pos.exit / pos.entry) * (1 - fee)
-                pos = None
+    i = 0
+    while i < n:
+        if i < n - 1 and sig[i] >= 1.0 and not np.isnan(atrv[i]):
+            sim = simulate_trade(o, h, lo, c, i, atrv[i], stop_atr=stop_atr,
+                                 rr=rr, fee_bps=fee_bps,
+                                 slippage_bps=slippage_bps, max_hold=max_hold,
+                                 sig=sig,
+                                 exit_on_signal_off=exit_on_signal_off,
+                                 index=idx)
+            if sim is None:
                 eq[i] = cur
-            else:
-                eq[i] = entry_eq * (c[i] / pos.entry)  # mark to market
-    if pos is not None:  # close at the final close, marked as open-end
-        pos.exit = c[-1] * (1 - slip)
-        pos.exit_time = idx[-1]
-        pos.exit_reason = "end_of_data"
-        pos.pnl_pct = (pos.exit / pos.entry) * (1 - fee) / (1 + fee) - 1
-        pos.r_multiple = pos.pnl_pct / ((pos.entry - pos.stop) / pos.entry)
-        res.trades.append(pos)
-        eq[-1] = entry_eq * (pos.exit / pos.entry) * (1 - fee)
+                i += 1
+                continue
+            t = sim.trade
+            res.trades.append(t)
+            entry_eq = cur * (1 - fee)        # entry fee hits equity at entry
+            for j in range(sim.entry_bar, sim.exit_bar):
+                eq[j] = entry_eq * (c[j] / t.entry)   # mark to market
+            eq[sim.exit_bar] = entry_eq * (t.exit / t.entry) * (1 - fee)
+            cur = eq[sim.exit_bar]
+            i = sim.exit_bar + 1
+        else:
+            eq[i] = cur
+            i += 1
 
     res.equity = pd.Series(eq, index=idx)
     return res

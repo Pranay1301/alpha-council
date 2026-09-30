@@ -54,20 +54,45 @@ available when no setup passes the policy.
 **The current bundled daily sample has zero approved suggestions.** BTC
 trend-following has median held-out profit factor 0.95; SOL trend-following
 has 0.58, both below the 1.0 veto threshold. The old single-split scores
-should not be used as evidence. The replay table measures selected past
-checkpoints on truncated historical data and now shows bars held and
-MAE/MFE; it is **not** a persistent paper-trading ledger or proof of
-live trading performance. The portfolio layer reports return correlation and historical BTC beta
+should not be used as evidence. The replay table reruns the desk's **exact decision policy** (candidate
+generation, hard risk vetoes, evidence, portfolio layer - no hindsight
+strategy selection) at past checkpoints on truncated historical data, and
+grades each call with the **same canonical execution** as the backtester:
+entry at the next bar's open plus slippage, stop/target from the following
+bar, stop wins collisions, fees both sides. It shows bars held and MAE/MFE;
+it is retrospective replay, **not** observed live performance. The portfolio layer reports return correlation and historical BTC beta
 (covariance/variance on up to 180 aligned return bars), and groups strongly
 correlated approvals as one distinct opportunity; this is not a complete
 portfolio sizing or thematic exposure model.
 
 Each live council stage records provider, model, UTC timestamp, SHA-256
 prompt/input/output hashes, latency and token usage in the exported report.
-No API key or raw model input is included in that metadata. An LLM council
-**effectiveness** claim would require prospective or carefully simulated
-paired quant-only vs council decisions with later outcomes. This project
-does not claim to have measured that yet.
+No API key or raw model input is included in that metadata.
+
+One canonical `simulate_trade`/`monitor_trade` pair
+(`alphacouncil/backtest.py`) is shared by the backtester, the historical
+replay, the paper ledger and the effectiveness study, so these views can
+never silently apply different rules. Walk-forward results report each
+fold's own parameters and metrics separately from the current live
+(modal-across-folds) parameters. Council outputs are strictly
+schema-validated against the live candidate set: unknown keys are dropped,
+indices must be unique and in range, prose is length-capped.
+
+The dashboard also carries:
+
+- a **paper ledger** (`alphacouncil/paper.py`): approved setups are
+  snapshotted at signal time and resolved bar-by-bar
+  (NEW -> ACTIVE -> TARGET/STOP/EXPIRED) against new data. Stored as JSON
+  in the app filesystem - durable when self-hosted, ephemeral on free
+  Streamlit hosting (the app says so and offers a download). Paper trades,
+  not real ones;
+- a **council effectiveness** paired replay
+  (`alphacouncil/effectiveness.py`): quant-only vs quant+council on
+  identical historical opportunities, with veto precision/recall when a
+  live model is attached. Samples are small and descriptive, not proof;
+- a **research integrity** panel listing the guarantees and the known
+  limits (no liquidity model, no funding costs, limited sample,
+  correlated assets).
 
 ## The strategies
 
@@ -139,9 +164,14 @@ python tests/test_desk.py         # end-to-end offline run, risk policy enforced
 
 ## Roadmap
 
-- [ ] paper-trading ledger: log suggestions, track outcomes vs stop/target
-- [ ] walk-forward with multiple rolling windows (not just one 70/30 cut)
+- [x] paper-trading ledger: suggestions snapshotted at signal time, resolved
+      vs stop/target (JSON storage; durable when self-hosted)
+- [x] walk-forward with multiple rolling windows (not just one 70/30 cut)
+- [x] paired quant-only vs quant+council effectiveness replay
+- [ ] durable hosted storage for the paper ledger (free DB)
 - [ ] short-side setups (perpetuals data) with funding-rate awareness
+- [ ] liquidity-aware execution, slippage sensitivity, bootstrap confidence
+      intervals, Monte Carlo trade-sequence analysis
 - [ ] scheduled runs with alerts (Telegram/WhatsApp) when a new setup appears
 
 ## Disclaimer

@@ -25,3 +25,14 @@ def test_multi_fold_aggregation_keys():
     assert tm["folds"] == 3
     assert 0.0 <= tm["profitable_windows"] <= 1.0
     assert 0.0 <= tm["param_stability"] <= 1.0
+
+
+def test_fold_metrics_align_with_fold_params():
+    df = _trendy()
+    wf = walk_forward(df, "trend_following", STRATEGIES["trend_following"],
+                      {"fast": [10, 20], "slow": [40, 50], "rsi_cap": [65.0]},
+                      n_folds=3, min_trades=1)
+    assert wf is not None
+    assert len(wf.fold_test_metrics) == len(wf.fold_params) == wf.test_metrics["folds"]
+    for m in wf.fold_test_metrics:
+        assert "profit_factor" in m and "trades" in m

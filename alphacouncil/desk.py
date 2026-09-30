@@ -8,6 +8,11 @@ Two layers, strictly separated:
    narrate, rank, veto, and attack the candidates - but every number on a
    final card comes from layer 1. This is how the tool stays honest:
    models write prose, code owns math.
+
+The quant decision policy lives in reusable helpers (evaluate_frames,
+hard_policy_vetoes, attach_evidence, correlation_map, distinct_count) so the
+historical replay and the effectiveness study run the EXACT same policy the
+live dashboard runs - no hindsight re-implementation.
 """
 
 from __future__ import annotations
@@ -42,6 +47,10 @@ BT_KW = {"stop_atr": 2.0, "rr": 2.0, "fee_bps": 10.0, "slippage_bps": 5.0}
 MIN_TEST_PF = 1.0
 MIN_TEST_TRADES = 4
 MAX_TEST_DD = 0.35
+CORR_BLOCK = 0.7     # |correlation| above which two setups are one opportunity
+
+MAX_TEXT = 1500      # cap for free-text LLM fields (notes, market view)
+MAX_PROSE = 800      # cap for per-candidate LLM prose (thesis, veto, bear case)
 
 
 @dataclass
@@ -50,18 +59,21 @@ class Candidate:
     symbol: str
     interval: str
     strategy: str
-    params: dict
+    params: dict            # CURRENT LIVE parameters (modal across folds)
     entry: float
     stop: float
     target: float
     atr: float
-    metrics: dict          # out-of-sample (test window) metrics
+    metrics: dict          # aggregate out-of-sample metrics (each fold used
+                           # its OWN parameters - see fold_params/fold_metrics)
     thesis: str = ""
     bear_case: str = ""
     vetoed: str = ""
     regime: str = ""
     regime_stats: dict = field(default_factory=dict)
     evidence: dict = field(default_factory=dict)
+    fold_params: list[dict] = field(default_factory=list)
+    fold_metrics: list[dict] = field(default_factory=list)
 
     def to_json(self) -> dict:
         return {"index": self.index, "symbol": self.symbol,
@@ -90,6 +102,16 @@ class DeskResult:
     distinct_opportunities: int = 0
     audit_log: list[dict] = field(default_factory=list)
 
+
+def load_frames(symbols: list[str], interval: str, offline: bool,
+                errors: list[str]) -> dict[str, pd.DataFrame]:
+    frames: dict[str, pd.DataFrame] = {}
+    for symbol in symbols:
+        try:
+            frames[symbol] = load(symbol, interval, offline=offline)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{symbol}: data load failed: {exc}")
+    return frames
 
 
 def _ml_walk_forward(df: pd.DataFrame, interval: str, n_folds: int = 3,
@@ -126,16 +148,16 @@ def _ml_walk_forward(df: pd.DataFrame, interval: str, n_folds: int = 3,
             "profitable_windows": float(np.mean([pf > 1.0 for pf in pfs])),
             "param_stability": 1.0}
 
-def _quant_candidates(symbols: list[str], interval: str, offline: bool,
-                      errors: list[str]) -> tuple[list[Candidate], list[dict]]:
+
+def evaluate_frames(frames: dict[str, pd.DataFrame], interval: str,
+                    errors: list[str]) -> tuple[list[Candidate], list[dict]]:
+    """THE quant candidate pipeline, shared by the live desk, the historical
+    replay and the effectiveness study: strategies -> rolling walk-forward ->
+    live-signal candidates carrying aggregate OOS metrics plus the per-fold
+    parameters/metrics behind them."""
     candidates: list[Candidate] = []
     leaderboard: list[dict] = []
-    for symbol in symbols:
-        try:
-            df = load(symbol, interval, offline=offline)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"{symbol}: data load failed: {exc}")
-            continue
+    for symbol, df in frames.items():
         try:
             for issue in validate(df, interval):
                 errors.append(f"{symbol} data quality: {issue}")
@@ -174,7 +196,8 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
                 strategy=name, params=wf.best_params, entry=price,
                 stop=price - risk, target=price + BT_KW["rr"] * risk,
                 atr=current_atr, metrics=wf.test_metrics,
-                regime=str(labels.iloc[-1]), regime_stats=reg_stats))
+                regime=str(labels.iloc[-1]), regime_stats=reg_stats,
+                fold_params=wf.fold_params, fold_metrics=wf.fold_test_metrics))
 
         # ML signal: same rolling walk-forward windows as the rule
         # strategies - refit per fold, held-out evaluation only
@@ -202,13 +225,98 @@ def _quant_candidates(symbols: list[str], interval: str, offline: bool,
     return candidates, leaderboard
 
 
-def _quant_summary(symbols: list[str], interval: str, offline: bool) -> dict:
-    out = {}
-    for symbol in symbols:
-        try:
-            df = load(symbol, interval, offline=offline)
-        except Exception:  # noqa: BLE001
+def hard_policy_vetoes(candidates: list[Candidate]) -> None:
+    """The desk's hard risk policy, in code. The LLM's veto is advisory;
+    these rules are not."""
+    for c in candidates:
+        m = c.metrics
+        reasons = []
+        if m.get("profit_factor", 0) < MIN_TEST_PF:
+            reasons.append(f"test profit factor {m.get('profit_factor', 0):.2f} < {MIN_TEST_PF}")
+        if m.get("trades", 0) < MIN_TEST_TRADES:
+            reasons.append(f"only {m.get('trades', 0)} test trades")
+        if m.get("max_drawdown", 1) > MAX_TEST_DD:
+            reasons.append(f"test max drawdown {m.get('max_drawdown', 0):.0%} > {MAX_TEST_DD:.0%}")
+        if reasons:
+            c.vetoed = "; ".join(reasons)
+
+
+def attach_evidence(candidates: list[Candidate],
+                    frames: dict[str, pd.DataFrame]) -> None:
+    """Deterministic evidence score for every non-vetoed candidate."""
+    for c in candidates:
+        if c.vetoed:
             continue
+        try:
+            df_c = frames[c.symbol]
+            med_dv = float((df_c["close"] * df_c["volume"]).tail(90).median())
+        except Exception:  # noqa: BLE001
+            med_dv = 0.0
+        c.evidence = evidence_score(c.metrics, c.regime_stats, c.regime, med_dv)
+
+
+def _returns(frames: dict[str, pd.DataFrame], bars: int = 180) -> dict:
+    rets = {}
+    for s, df in frames.items():
+        try:
+            rets[s] = df["close"].pct_change(fill_method=None).dropna().tail(bars)
+        except Exception:  # noqa: BLE001
+            pass
+    return rets
+
+
+def correlation_map(frames: dict[str, pd.DataFrame]) -> dict:
+    """Pairwise close-to-close return correlation over up to 180 bars."""
+    corr: dict = {}
+    rets = _returns(frames)
+    symbols = list(frames)
+    for i, a in enumerate(symbols):
+        for b in symbols[i + 1:]:
+            if a in rets and b in rets:
+                joined = pd.concat([rets[a], rets[b]], axis=1, join="inner")
+                if len(joined) > 30:
+                    corr[f"{a}/{b}"] = round(float(joined.corr().iloc[0, 1]), 3)
+    return corr
+
+
+def beta_map(frames: dict[str, pd.DataFrame]) -> dict:
+    """Empirical beta to BTC: aligned close-to-close returns over up to 180
+    bars. Not an investable factor model; unavailable without BTC data."""
+    rets = _returns(frames)
+    beta_to_btc: dict = {}
+    if "BTCUSD" in rets and len(rets["BTCUSD"]) > 30:
+        btc = rets["BTCUSD"]
+        for sym, returns in rets.items():
+            aligned = pd.concat([returns, btc], axis=1, join="inner").dropna()
+            if len(aligned) < 30:
+                continue
+            variance = float(aligned.iloc[:, 1].var())
+            if variance > 1e-12:
+                beta_to_btc[sym] = round(float(aligned.iloc[:, 0].cov(
+                    aligned.iloc[:, 1]) / variance), 2)
+    return beta_to_btc
+
+
+def distinct_count(approved: list[Candidate], corr: dict) -> int:
+    """Count materially distinct opportunities: one per symbol, and highly
+    correlated symbols (|corr| >= CORR_BLOCK) collapse into one."""
+    distinct = 0
+    picked: list[str] = []
+    for c in sorted(approved, key=lambda x: -x.evidence.get("total", 0)):
+        dup = False
+        for p in picked:
+            if p == c.symbol or abs(corr.get(f"{p}/{c.symbol}", corr.get(f"{c.symbol}/{p}", 1.0))) >= CORR_BLOCK:
+                dup = True
+                break
+        if not dup:
+            distinct += 1
+            picked.append(c.symbol)
+    return distinct
+
+
+def _quant_summary(frames: dict[str, pd.DataFrame], interval: str) -> dict:
+    out = {}
+    for symbol, df in frames.items():
         close = df["close"]
         out[symbol] = {
             "price": round(float(close.iloc[-1]), 4),
@@ -221,50 +329,93 @@ def _quant_summary(symbols: list[str], interval: str, offline: bool) -> dict:
     return out
 
 
-
-
-def _clean_str_dict(v) -> dict:
-    """Keep only int-coercible keys mapping to strings."""
+def _clean_str_dict(v, valid_indices: set[int] | None = None,
+                    max_len: int = MAX_PROSE) -> dict:
+    """Keep only in-range int-coercible keys mapping to capped strings."""
     if not isinstance(v, dict):
         return {}
     out = {}
     for k, val in v.items():
-        if str(k).lstrip("-").isdigit() and isinstance(val, str):
-            out[str(k)] = val
+        if not (str(k).lstrip("-").isdigit() and isinstance(val, str)):
+            continue
+        i = int(k)
+        if i < 0 or (valid_indices is not None and i not in valid_indices):
+            continue
+        out[str(i)] = val[:max_len]
     return out
 
 
-def validate_llm(prompt_name: str, parsed: dict) -> dict:
-    """Strict shape checking for council responses. A malformed field is
-    dropped, never passed downstream - models write prose, code owns math."""
+def _clean_index_list(v, valid_indices: set[int] | None = None) -> list[int]:
+    """Unique non-negative ints; when valid_indices is given, each index must
+    refer to an actual candidate (0 <= i < candidate_count)."""
+    if not isinstance(v, list):
+        return []
+    out: list[int] = []
+    for i in v:
+        if not (isinstance(i, (int, float, str)) and str(i).lstrip("-").isdigit()):
+            continue
+        n = int(i)
+        if n < 0 or (valid_indices is not None and n not in valid_indices):
+            continue
+        if n not in out:
+            out.append(n)
+    return out
+
+
+# The strict contract each council stage must satisfy. Unknown keys are
+# dropped; only the listed keys survive validation.
+_STAGE_KEYS = {
+    "analyst.md": {"market_view", "reason"},
+    "strategist.md": {"ranked", "thesis"},
+    "risk.md": {"vetoes", "approved", "notes"},
+    "critic.md": {"bear_case"},
+}
+
+
+def validate_llm(prompt_name: str, parsed: dict,
+                 valid_indices: set[int] | None = None) -> dict:
+    """STRICT schema validation for council responses, bound to the actual
+    candidate set when valid_indices is given:
+
+    - only the stage's expected keys survive
+    - candidate indices must be unique, non-negative and refer to a real
+      candidate (0 <= index < candidate_count)
+    - per-field types are enforced; prose fields are length-capped
+
+    A malformed field is dropped, never passed downstream - models write
+    prose, code owns math. Without valid_indices (no candidates in play),
+    indices only need to be non-negative ints.
+    """
     if not isinstance(parsed, dict):
         return {}
+    allowed = _STAGE_KEYS.get(prompt_name)
+    if allowed is not None:
+        parsed = {k: v for k, v in parsed.items() if k in allowed}
     if prompt_name == "analyst.md":
-        return {k: v for k, v in parsed.items() if isinstance(v, str)}
+        return {k: v[:MAX_TEXT] for k, v in parsed.items() if isinstance(v, str)}
     if prompt_name == "strategist.md":
         ranked = parsed.get("ranked", "all")
         if ranked != "all":
-            if not isinstance(ranked, list):
+            ranked = _clean_index_list(ranked, valid_indices)
+            if not ranked:
                 ranked = "all"
-            else:
-                ranked = [int(i) for i in ranked
-                          if isinstance(i, (int, float, str)) and str(i).lstrip("-").isdigit() and int(i) >= 0]
-        return {"ranked": ranked, "thesis": _clean_str_dict(parsed.get("thesis"))}
+        return {"ranked": ranked,
+                "thesis": _clean_str_dict(parsed.get("thesis"), valid_indices)}
     if prompt_name == "risk.md":
-        approved = parsed.get("approved", [])
-        if not isinstance(approved, list):
-            approved = []
         notes = parsed.get("notes", "")
-        return {"vetoes": _clean_str_dict(parsed.get("vetoes")),
-                "approved": [int(i) for i in approved
-                             if isinstance(i, (int, float, str)) and str(i).lstrip("-").isdigit()],
-                "notes": notes if isinstance(notes, str) else ""}
+        return {"vetoes": _clean_str_dict(parsed.get("vetoes"), valid_indices),
+                "approved": _clean_index_list(parsed.get("approved", []),
+                                              valid_indices),
+                "notes": notes[:MAX_TEXT] if isinstance(notes, str) else ""}
     if prompt_name == "critic.md":
-        return {"bear_case": _clean_str_dict(parsed.get("bear_case"))}
+        return {"bear_case": _clean_str_dict(parsed.get("bear_case"),
+                                             valid_indices)}
     return parsed
 
+
 def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict,
-         raw_as: str | None = None, audit_log: list[dict] | None = None) -> dict:
+         raw_as: str | None = None, audit_log: list[dict] | None = None,
+         valid_indices: set[int] | None = None) -> dict:
     if model is None:
         return fallback
     system = (PROMPTS_DIR / prompt_name).read_text()
@@ -292,21 +443,22 @@ def _ask(model: Model | None, prompt_name: str, payload: dict, fallback: dict,
         })
     parsed = parse_json(resp.content)
     if parsed:
-        return validate_llm(prompt_name, parsed)
+        return validate_llm(prompt_name, parsed, valid_indices)
     text = resp.content.strip()
     if raw_as and text:
-        return {raw_as: text[:1500]}
+        return {raw_as: text[:MAX_TEXT]}
     return fallback
 
 
 def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
              model: Model | None = None) -> DeskResult:
     errors: list[str] = []
-    candidates, leaderboard = _quant_candidates(symbols, interval, offline, errors)
-    summary = _quant_summary(symbols, interval, offline)
-    for s in symbols:
+    frames = load_frames(symbols, interval, offline, errors)
+    candidates, leaderboard = evaluate_frames(frames, interval, errors)
+    summary = _quant_summary(frames, interval)
+    for s, df in frames.items():
         try:
-            summary[s]["regime"] = str(classify(load(s, interval, offline=offline)).iloc[-1])
+            summary[s]["regime"] = str(classify(df).iloc[-1])
         except Exception:  # noqa: BLE001
             pass
     summary["interval"] = interval
@@ -323,7 +475,8 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
 
     payload = {"candidates": [c.to_json() for c in candidates]}
     strat = _ask(model, "strategist.md", payload, {"ranked": "all", "thesis": {}},
-                audit_log=audit_log)
+                audit_log=audit_log,
+                valid_indices={c.index for c in candidates})
     # thesis keys refer to the ORIGINAL indices in payload - apply before reordering
     for k, v in (strat.get("thesis") or {}).items():
         if str(k).isdigit() and int(k) in {c.index for c in candidates}:
@@ -340,20 +493,11 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
     risk_payload = {"candidates": [c.to_json() for c in candidates]}
     risk = _ask(model, "risk.md", risk_payload,
                 {"vetoes": {}, "approved": [c.index for c in candidates], "notes": ""},
-                audit_log=audit_log)
+                audit_log=audit_log,
+                valid_indices=set(range(len(candidates))))
     # code enforces the risk policy too - the LLM's veto is advisory,
     # the hard rules below are not
-    for c in candidates:
-        m = c.metrics
-        reasons = []
-        if m.get("profit_factor", 0) < MIN_TEST_PF:
-            reasons.append(f"test profit factor {m.get('profit_factor', 0):.2f} < {MIN_TEST_PF}")
-        if m.get("trades", 0) < MIN_TEST_TRADES:
-            reasons.append(f"only {m.get('trades', 0)} test trades")
-        if m.get("max_drawdown", 1) > MAX_TEST_DD:
-            reasons.append(f"test max drawdown {m.get('max_drawdown', 0):.0%} > {MAX_TEST_DD:.0%}")
-        if reasons:
-            c.vetoed = "; ".join(reasons)
+    hard_policy_vetoes(candidates)
     for k, v in (risk.get("vetoes") or {}).items():
         if str(k).isdigit() and int(k) < len(candidates) and not candidates[int(k)].vetoed:
             candidates[int(k)].vetoed = f"risk manager: {v}"
@@ -361,58 +505,19 @@ def run_desk(symbols: list[str], interval: str = "1d", *, offline: bool = False,
     approved = [c for c in candidates if not c.vetoed]
     critic = _ask(model, "critic.md",
                   {"candidates": [c.to_json() for c in approved]},
-                  {"bear_case": {}}, audit_log=audit_log)
+                  {"bear_case": {}}, audit_log=audit_log,
+                  valid_indices={c.index for c in approved})
     approved_idx = {c.index: c for c in approved}
     for k, v in (critic.get("bear_case") or {}).items():
         if str(k).isdigit() and int(k) in approved_idx:
             approved_idx[int(k)].bear_case = v
 
     # portfolio layer: pairwise return correlation + distinct opportunities
-    corr: dict = {}
-    rets = {}
-    for s in symbols:
-        try:
-            rets[s] = load(s, interval, offline=offline)["close"].pct_change().dropna().tail(180)
-        except Exception:  # noqa: BLE001
-            pass
-    for i, a in enumerate(symbols):
-        for b in symbols[i + 1:]:
-            if a in rets and b in rets:
-                joined = pd.concat([rets[a], rets[b]], axis=1, join="inner")
-                if len(joined) > 30:
-                    corr[f"{a}/{b}"] = round(float(joined.corr().iloc[0, 1]), 3)
-    # Empirical beta, not an investable factor model: aligned close-to-close
-    # returns over up to 180 bars. No BTC data means beta is unavailable.
-    beta_to_btc: dict = {}
-    if "BTCUSD" in rets and len(rets["BTCUSD"]) > 30:
-        btc = rets["BTCUSD"]
-        for sym, returns in rets.items():
-            aligned = pd.concat([returns, btc], axis=1, join="inner").dropna()
-            if len(aligned) < 30:
-                continue
-            variance = float(aligned.iloc[:, 1].var())
-            if variance > 1e-12:
-                beta_to_btc[sym] = round(float(aligned.iloc[:, 0].cov(
-                    aligned.iloc[:, 1]) / variance), 2)
+    corr = correlation_map(frames)
+    beta_to_btc = beta_map(frames)
     approved_list = [c for c in candidates if not c.vetoed]
-    for c in approved_list:
-        try:
-            df_c = load(c.symbol, interval, offline=offline)
-            med_dv = float((df_c["close"] * df_c["volume"]).tail(90).median())
-        except Exception:  # noqa: BLE001
-            med_dv = 0.0
-        c.evidence = evidence_score(c.metrics, c.regime_stats, c.regime, med_dv)
-    distinct = 0
-    picked: list[str] = []
-    for c in sorted(approved_list, key=lambda x: -x.evidence.get("total", 0)):
-        dup = False
-        for p in picked:
-            if p == c.symbol or abs(corr.get(f"{p}/{c.symbol}", corr.get(f"{c.symbol}/{p}", 1.0))) >= 0.7:
-                dup = True
-                break
-        if not dup:
-            distinct += 1
-            picked.append(c.symbol)
+    attach_evidence(approved_list, frames)
+    distinct = distinct_count(approved_list, corr)
 
     council_log = [
         {"stage": "analyst - market view", "output": market_view or "(no market view)"},

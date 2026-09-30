@@ -43,6 +43,15 @@ def render_markdown(res: DeskResult) -> str:
                      f"Sharpe {m.get('sharpe', 0):.2f}")
         if c.thesis:
             lines.append(f"- thesis (strategist agent): {c.thesis}")
+        if c.fold_params and c.fold_metrics:
+            folds = "; ".join(
+                f"fold {i} `{fp}` -> PF {fm.get('profit_factor', 0):.2f}, "
+                f"{fm.get('trades', 0)} trades"
+                for i, (fp, fm) in enumerate(zip(c.fold_params, c.fold_metrics), 1))
+            lines.append(f"- walk-forward folds (each traded its own parameters): {folds}")
+            lines.append(f"- current live parameters: `{c.params}` (modal across "
+                         "folds - aggregate OOS metrics above come from each "
+                         "fold's own parameters, not necessarily these)")
         if c.bear_case:
             lines.append(f"- bear case (critic agent): {c.bear_case}")
         lines.append("")
@@ -72,6 +81,15 @@ def render_markdown(res: DeskResult) -> str:
         for e in res.errors:
             lines.append(f"- {e}")
         lines.append("")
+    lines.append("## Research integrity\n")
+    lines.append("- no lookahead; next-bar-open execution with slippage")
+    lines.append("- rolling out-of-sample validation (3 test windows); ML refit per fold")
+    lines.append("- conservative stop collision (a bar touching both counts as a stop)")
+    lines.append("- fees and slippage included in every backtest, replay and ledger number")
+    lines.append("- LLM cannot modify trade numbers; outputs strictly schema-validated")
+    lines.append("- historical replay runs the desk's exact decision policy on truncated data")
+    lines.append("- one canonical execution function shared by backtester, replay and paper ledger")
+    lines.append("- limits: no liquidity model, no funding costs, limited sample, correlated assets\n")
     lines.append("---")
     lines.append(FULL)
     return "\n".join(lines)
