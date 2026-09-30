@@ -424,8 +424,11 @@ if run and symbols:
                                ("Worst trade %", "worst_trade_pct"),
                                ("False-positive rate", "false_positive_rate")):
                 qv, cv = qm[key], cm[key]
-                if isinstance(qv, float) and key in ("win_rate", "false_positive_rate"):
+                if key in ("win_rate", "false_positive_rate"):
                     qv, cv = f"{qv:.0%}", f"{cv:.0%}"
+                else:
+                    qv = "none" if qv is None else str(qv)
+                    cv = "none" if cv is None else str(cv)
                 eff_rows.append({"Metric": label, "Quant-only": qv,
                                  "Quant + council": cv})
             st.dataframe(pd.DataFrame(eff_rows), width="stretch", hide_index=True)
