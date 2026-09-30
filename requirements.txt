@@ -8,7 +8,7 @@ openai>=1.0
 # Dashboard only: streamlit run app.py
 streamlit>=1.30
 
-# Force rebuild: dependency-set change triggers a full container restart on Streamlit Cloud
+# Force rebuild 2026-09-30b: dependency-set change triggers a full container restart on Streamlit Cloud
 
 # Candlestick research charts
 plotly>=5.20,<7
