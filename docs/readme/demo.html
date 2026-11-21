@@ -1,0 +1,51 @@
+<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width"><style>*{box-sizing:border-box}body{background:#10141a;color:#e5edf4;margin:0;font:16px/1.6 ui-monospace,monospace}header{padding:28px 40px;border-bottom:1px solid #303944;background:#171e27}h1{font:600 30px/1.2 system-ui;margin:6px 0 12px}small,.muted{color:#9fafbd}main{padding:16px 40px}section{margin:14px 0 40px}h2{font:500 16px/1.6 ui-monospace,monospace;color:#87deba;white-space:pre-wrap;overflow-wrap:anywhere}pre{font:14px/1.65 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.exit{font-size:13px;color:#9fafbd}.pill{font:12px system-ui;background:#253b33;color:#9ee1bf;padding:5px 8px;border-radius:4px}</style><header><span class='pill'>RECORDED OUTPUT REPLAY</span><h1>alpha-council</h1><small>Executed locally 2026-11-13 · No live inference in this viewer<br>Source commit de5afd601089 · Full output: executed.json</small></header><main><section><h2>$ python3 examples/run_desk.py</h2><pre># alpha-council research report
+*2026-11-13 11:44 UTC - BTCUSD, ETHUSD, SOLUSD (1d) - quant-only / mock council*
+
+&gt; Research tool. Suggestions only - not financial advice.
+
+## Market view (analyst agent)
+
+Across the covered majors the desk sees a mixed regime: RSI in neutral-to-strong bands and price stretched relative to the 20/50-bar trend on some names, flat on others. Volatility (ATR%) is within its recent range. The desk is watching whether trend signals hold above their EMA50 anchors on the next bars.
+
+## Trade suggestions (0)
+
+No live setups passed the desk&#x27;s risk policy right now. No suggestion IS the suggestion.
+
+## Vetoed by risk policy (2)
+
+- **BTCUSD trend_following**: test profit factor 0.95 &lt; 1.0
+- **SOLUSD trend_following**: test profit factor 0.58 &lt; 1.0
+
+## Council run audit metadata
+
+- analyst: MockModel / mock at 2026-11-13T11:44:45.573981+00:00; prompt SHA256 8e4ae298ba33a2159f023522975a70f891a51ae148cf24d936e14c8643b5436d; input SHA256 f460e80ffc8ea59d3c586da1f48072be854465bb91e1c326f23f001d130fd51d; output SHA256 f0f5e4a9824c3dafd1a5b21618cc02e93751314cd0d93585c2ff9cdd23135415; 0 ms, tokens 0+0
+- strategist: MockModel / mock at 2026-11-13T11:44:45.574656+00:00; prompt SHA256 e4f2e34d0bb13ad6a6641305acaeb49b7317f8a3fe582ed5a3a779b2d7569aeb; input SHA256 6c0b73431fc5e1fefaecdace960dd5bf8e7e40c95f21c2faeb66ee5920c68fbd; output SHA256 ab84981b1b9283ec207949fa714db2176552725171b1caff9a34297a129ba012; 0 ms, tokens 0+0
+- risk: MockModel / mock at 2026-11-13T11:44:45.575223+00:00; prompt SHA256 5bd0aeb9b853792dd4702d1a14d2fb37912085428981698c88a37f8f255de32d; input SHA256 6c0b73431fc5e1fefaecdace960dd5bf8e7e40c95f21c2faeb66ee5920c68fbd; output SHA256 335bb114f62ad193e283983c99fb6a5ed1527c3155ae9c08bc5b86b399b73b1b; 0 ms, tokens 0+0
+- critic: MockModel / mock at 2026-11-13T11:44:45.575701+00:00; prompt SHA256 cff5ce0d4a2d6a968145d0536702a4d248b4cfd644b1f7efe11e89c02bfcfa80; input SHA256 fc25c2ea5e68bdac506901971fa0338e01bc3eb373a118728daa04d0d3e10437; output SHA256 70bb0efaefa61d68a98c2fa0a1eec6225caa8f5627819cbaea4e7882a126167e; 0 ms, tokens 0+0
+
+## Risk notes (risk manager agent)
+
+Treat every suggestion as one position of many; size so a full stop-out costs a small fixed fraction of the account.
+
+## Research integrity
+
+- no lookahead; next-bar-open execution with slippage
+- rolling out-of-sample validation (3 test windows); ML refit per fold
+- conservative stop collision (a bar touching both counts as a stop)
+- fees and slippage included in every backtest, replay and ledger number
+- LLM cannot modify trade numbers; outputs strictly schema-validated
+- historical replay runs the desk&#x27;s exact decision policy on truncated data
+- one canonical execution function shared by backtester, replay and paper ledger
+- limits: no liquidity model, no funding costs, limited sample, correlated assets
+
+---
+DISCLAIMER: alpha-council is a research and education project. Nothing it produces is financial advice, a recommendation to buy or sell, or a guarantee of profit. Backtests describe the past, not the future: they can overfit, ignore real-world liquidity, and break down when market regimes change. Crypto assets are highly volatile and you can lose all of your money. Do your own research and consider talking to a licensed financial advisor before risking anything.
+</pre><p class='exit'>Process exit: 0</p></section><section><h2>$ python3 -m pytest tests -q</h2><pre>.............................................................            [100%]
+=============================== warnings summary ===============================
+tests/test_data.py::test_nan_detected
+  /downloads/readme-refresh/alpha-council/alphacouncil/data.py:149: FutureWarning: The default fill_method=&#x27;pad&#x27; in Series.pct_change is deprecated and will be removed in a future version. Either fill in any non-leading NA values prior to calling pct_change or specify &#x27;fill_method=None&#x27; to not fill NA values.
+    jumps = df[&quot;close&quot;].pct_change().abs()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+61 passed, 1 warning in 9.40s
+</pre><p class='exit'>Process exit: 0</p></section></main>

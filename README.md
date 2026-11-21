@@ -1,5 +1,27 @@
 # alpha-council
 
+A crypto research desk where code owns the numbers and a hard risk policy can return no setup.
+
+## See it work
+
+[Open the dashboard](https://alpha-council-6hkkwmjbnsuyqd8rfnc494.streamlit.app). Verified 2026-11-13: wakes from sleep, quant-only run completed. Bundled bars end 2026-09-29 and are stale, not current market advice.
+
+![Hosted alpha-council app, verified 2026-11-13](docs/readme/app.png)
+
+![Recorded alpha-council execution](docs/readme/screenshot.png)
+
+[Watch the MP4](docs/readme/demo.mp4) · [Short animation](docs/readme/demo.gif) · [Full-size screenshot](docs/readme/screenshot.png) · [Raw executed output](docs/readme/executed.json)
+
+The video records **actual local command execution** on 2026-11-13, including process exit codes. The animation is a short excerpt. Model replies, where present, are scripted; no live inference is implied. A separate saved-output viewer is in `docs/readme/demo.html`.
+
+## Fresh verification · 2026-11-13
+
+61 tests passed. The bundled sample produced no approved setups; the council in this local run is a mock, not live inference.
+
+Source commit and complete command outputs, including warnings and exit codes, are in [the evidence file](docs/readme/executed.json). Test success covers the checks listed there, not production readiness.
+
+## Project guide
+
 **[Live dashboard](https://alpha-council-6hkkwmjbnsuyqd8rfnc494.streamlit.app)**
 
 **An AI research desk for crypto.** LLM agents propose, rank, veto and

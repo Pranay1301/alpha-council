@@ -1,0 +1,12 @@
+{
+  "repo": "alpha-council",
+  "base_sha": "de5afd601089d94d6826473bbd7d53b47cd60195",
+  "test": {
+    "command": "python3 -m pytest tests -q",
+    "exit_code": 0,
+    "stdout": ".............................................................            [100%]\n=============================== warnings summary ===============================\ntests/test_data.py::test_nan_detected\n  /downloads/readme-refresh/alpha-council/alphacouncil/data.py:149: FutureWarning: The default fill_method='pad' in Series.pct_change is deprecated and will be removed in a future version. Either fill in any non-leading NA values prior to calling pct_change or specify 'fill_method=None' to not fill NA values.\n    jumps = df[\"close\"].pct_change().abs()\n\n-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n61 passed, 1 warning in 9.71s\n",
+    "stderr": ""
+  },
+  "status": " M README.md\n?? docs/\n",
+  "diff_stat": " README.md | 24 +++++++++++++++++++++++-\n 1 file changed, 23 insertions(+), 1 deletion(-)\n"
+}
